@@ -6,13 +6,20 @@
  * metadata is written here immediately and kept out of the service worker's
  * heap. Only small counters stay in memory.
  *
- * Layout (v2):
- *  - resources:  `${session}|${name}` -> ArrayBuffer, content-addressed (sha1)
- *  - snapshots:  autoincrement {id, session, json}
- *  - events:     autoincrement {id, session, data}, append-only action/console log
- *  - requests:   `${session}|${rid}` -> tracked network request object
- *  - sessions:   keyPath session -> sessionInfo (also the crash-recovery marker)
- *  - traces:     keyPath id -> finished archive {…, data: ArrayBuffer}
+ * Layout (v3):
+ *  - resources:    `${session}|${name}` -> ArrayBuffer, content-addressed (sha1)
+ *  - snapshots:    autoincrement {id, session, json}
+ *  - events:       autoincrement {id, session, data}, append-only action/console log
+ *  - requests:     `${session}|${rid}` -> tracked network request object
+ *  - sessions:     keyPath session -> sessionInfo (also the crash-recovery marker)
+ *  - traces:       keyPath id -> finished archive metadata {…, chunks: count}
+ *  - traceChunks:  `${id}|${seq}` -> archive slice (TRACE_CHUNK_BYTES each)
+ *
+ * Finished archives are stored as fixed-size inline-byte slices, never as one
+ * whole-archive ArrayBuffer: saving a long recording would otherwise require
+ * the complete zip to reside in the service worker's heap at once. The reader
+ * folds slices back into a disk-backed Blob a few at a time. v2 archives used
+ * a single inline `data` field on the traces record; those stay readable.
  *
  * Resources and archives are stored as ArrayBuffers, NOT Blobs. A Blob read out
  * of IndexedDB inside an MV3 service worker is backed by a lazy internal blob:
@@ -26,7 +33,7 @@
  */
 
 const DB_NAME = 'ptr-trace-store';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORE_RESOURCES = 'resources';
 const STORE_SNAPSHOTS = 'snapshots';
@@ -34,6 +41,13 @@ const STORE_EVENTS = 'events';
 const STORE_REQUESTS = 'requests';
 const STORE_SESSIONS = 'sessions';
 const STORE_TRACES = 'traces';
+const STORE_TRACE_CHUNKS = 'traceChunks';
+
+// One archive slice in IndexedDB. Small enough to keep slice.arrayBuffer()
+// bounded, large enough to keep per-slice transaction overhead negligible.
+const TRACE_CHUNK_BYTES = 4 * 1024 * 1024;
+const CHUNK_SEQ_DIGITS = 10;
+const CHUNK_READ_BATCH = 4;
 
 let dbPromise = null;
 
@@ -65,6 +79,10 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains(STORE_SESSIONS)) {
         db.createObjectStore(STORE_SESSIONS, { keyPath: 'session' });
+      }
+      // v3: finished archives are stored slice-by-slice instead of inline.
+      if (!db.objectStoreNames.contains(STORE_TRACE_CHUNKS)) {
+        db.createObjectStore(STORE_TRACE_CHUNKS);
       }
     };
     request.onsuccess = () => {
@@ -373,7 +391,7 @@ export async function sweepOrphanSessions(keepSession) {
   }
 }
 
-// ── Finished traces ───────────────────────────────────────────────────────────
+// ── Finished traces (metadata + chunked archive) ──────────────────────────────
 
 export async function putTrace(record) {
   await withStore(STORE_TRACES, 'readwrite',
@@ -385,8 +403,85 @@ export async function getTrace(id) {
     store => runRequest(store.get(id)));
 }
 
+function chunkKey(id, seq) {
+  return `${id}|${String(seq).padStart(CHUNK_SEQ_DIGITS, '0')}`;
+}
+
+/**
+ * Persist a finished archive as fixed-size inline slices followed by the
+ * metadata record. Each slice is read out of the disk-backed Blob on its own,
+ * so heap residency never exceeds one slice.
+ */
+export async function putTraceArchive(meta, blob) {
+  const total = blob.size || blob.byteLength || 0;
+  const chunkCount = Math.max(1, Math.ceil(total / TRACE_CHUNK_BYTES));
+  for (let seq = 0; seq < chunkCount; seq++) {
+    const start = seq * TRACE_CHUNK_BYTES;
+    const end = Math.min(start + TRACE_CHUNK_BYTES, total);
+    const data = await blob.slice(start, end).arrayBuffer();
+    await withStore(STORE_TRACE_CHUNKS, 'readwrite',
+      store => runRequest(store.put(data, chunkKey(meta.id, seq))));
+  }
+  await putTrace({
+    id: meta.id,
+    name: meta.name,
+    url: meta.url,
+    timestamp: meta.timestamp,
+    size: meta.size,
+    chunks: chunkCount
+  });
+}
+
+/**
+ * Iterate an archive's slices in order, a small batch per transaction. Reading
+ * must page like readIndexBatched: a cursor transaction auto-commits when the
+ * event loop drains, and the consumer (Blob folding) is slow.
+ */
+export async function* readTraceChunks(id, batchSize = CHUNK_READ_BATCH) {
+  for (let seq = 0; ; seq += batchSize) {
+    const range = IDBKeyRange.bound(chunkKey(id, seq), chunkKey(id, seq + batchSize - 1));
+    const batch = await withStore(STORE_TRACE_CHUNKS, 'readonly',
+      store => runRequest(store.getAll(range, batchSize)));
+    if (!batch || batch.length === 0) return;
+    for (const chunk of batch) yield chunk;
+    if (batch.length < batchSize) return;
+  }
+}
+
+/**
+ * Reassemble an archive into a disk-backed Blob without ever holding more than
+ * a few slices in the JS heap: nested Blobs reference their parts instead of
+ * copying them. Legacy v2 records with an inline `data` field are wrapped
+ * directly.
+ */
+export async function readTraceBlob(id, mimeType = 'application/zip') {
+  const record = await getTrace(id);
+  if (!record) return null;
+  if (record.data) {
+    return new Blob([record.data], { type: mimeType });
+  }
+  if (!record.chunks) return null;
+
+  let folded = null;
+  const pending = [];
+  const fold = () => {
+    if (pending.length === 0) return;
+    folded = folded ? new Blob([folded, ...pending]) : new Blob(pending);
+    pending.length = 0;
+  };
+  for await (const chunk of readTraceChunks(id)) {
+    pending.push(chunk);
+    if (pending.length >= CHUNK_READ_BATCH) fold();
+  }
+  fold();
+  return folded ? new Blob([folded], { type: mimeType }) : new Blob([], { type: mimeType });
+}
+
 export async function deleteTrace(id) {
-  return withStore(STORE_TRACES, 'readwrite',
+  const range = IDBKeyRange.bound(`${id}|`, `${id}|￿`);
+  await withStore(STORE_TRACE_CHUNKS, 'readwrite',
+    store => runRequest(store.delete(range)));
+  await withStore(STORE_TRACES, 'readwrite',
     store => runRequest(store.delete(id)));
 }
 

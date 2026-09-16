@@ -4,7 +4,8 @@
  * Produces a standard (non-zip64) DEFLATE archive without ever holding the whole
  * archive in the JS heap:
  *  - each entry is compressed through CompressionStream('deflate-raw') chunk by chunk
- *  - only ONE entry's compressed payload is buffered at a time
+ *  - the data-descriptor flag (bit 3) lets compressed chunks roll out in order,
+ *    before the entry's CRC/sizes are known, so nothing is buffered per entry
  *  - finished bytes are folded into a disk-backed Blob as they accumulate
  *
  * Replaces JSZip on the write path, which buffered every file plus the complete
@@ -18,6 +19,11 @@ const EOCD_SIG = 0x06054b50;
 const METHOD_DEFLATE = 8;
 const VERSION_NEEDED = 20;
 const FLAG_UTF8 = 0x0800;
+// Bit 3: CRC/sizes live in a data descriptor AFTER the payload, so the local
+// header can be emitted before compression and compressed chunks stream
+// straight into the rolling blob instead of buffering the whole entry.
+const FLAG_DATA_DESCRIPTOR = 0x0008;
+const DATA_DESCRIPTOR_SIG = 0x08074b50;
 
 const MAX_UINT32 = 0xffffffff;
 const MAX_UINT16 = 0xffff;
@@ -174,8 +180,12 @@ export class ZipBlobWriter {
 
   /**
    * Append an entry, pulling its payload from an (async) iterable of chunks.
-   * Nothing but the compressed result is buffered, so a multi-hundred-megabyte
-   * entry costs only its compressed size in heap.
+   *
+   * With the data-descriptor flag the local header is emitted first (zero
+   * CRC/sizes), compressed chunks roll into the output blob as they leave
+   * CompressionStream, and the real sizes/CRC trail behind as a 16-byte data
+   * descriptor. Nothing beyond CompressionStream's own queue is buffered, so a
+   * multi-hundred-megabyte incompressible entry never sits in the JS heap.
    */
   async addStream(name, chunks) {
     if (this._finished) throw new Error('ZipBlobWriter already finished');
@@ -184,8 +194,29 @@ export class ZipBlobWriter {
 
     let crc = 0;
     let rawSize = 0;
-    const compressed = [];
     let compSize = 0;
+
+    const nameBytes = textEncoder.encode(name);
+    const offset = this._out.length;
+    if (offset > MAX_UINT32)
+      throw new Error('Zip archive exceeds 4 GB limit');
+
+    // Local file header with placeholder sizes (data descriptor follows).
+    const header = new Uint8Array(30 + nameBytes.length);
+    const headerView = new DataView(header.buffer);
+    headerView.setUint32(0, LOCAL_HEADER_SIG, true);
+    headerView.setUint16(4, VERSION_NEEDED, true);
+    headerView.setUint16(6, FLAG_UTF8 | FLAG_DATA_DESCRIPTOR, true);
+    headerView.setUint16(8, METHOD_DEFLATE, true);
+    headerView.setUint16(10, this._dosTime, true);
+    headerView.setUint16(12, this._dosDate, true);
+    headerView.setUint32(14, 0, true); // CRC-32 — in data descriptor
+    headerView.setUint32(18, 0, true); // compressed size — in data descriptor
+    headerView.setUint32(22, 0, true); // uncompressed size — in data descriptor
+    headerView.setUint16(26, nameBytes.length, true);
+    headerView.setUint16(28, 0, true); // extra field length
+    header.set(nameBytes, 30);
+    this._out.push(header);
 
     // Wrap the source so we can checksum and measure while streaming through.
     const measured = (async function* () {
@@ -199,37 +230,30 @@ export class ZipBlobWriter {
     })();
 
     await deflateRaw(measured, (chunk) => {
-      compressed.push(chunk);
       compSize += chunk.byteLength;
+      this._out.push(chunk);
     });
 
     if (rawSize > MAX_UINT32 || compSize > MAX_UINT32)
       throw new Error(`Zip entry "${name}" exceeds the 4 GB limit`);
 
-    const nameBytes = textEncoder.encode(name);
-    const offset = this._out.length;
-    if (offset > MAX_UINT32)
-      throw new Error('Zip archive exceeds the 4 GB limit');
+    // Data descriptor (signature + CRC-32 + compressed + uncompressed size).
+    const descriptor = new Uint8Array(16);
+    const descriptorView = new DataView(descriptor.buffer);
+    descriptorView.setUint32(0, DATA_DESCRIPTOR_SIG, true);
+    descriptorView.setUint32(4, crc, true);
+    descriptorView.setUint32(8, compSize, true);
+    descriptorView.setUint32(12, rawSize, true);
+    this._out.push(descriptor);
 
-    const header = new Uint8Array(30 + nameBytes.length);
-    const view = new DataView(header.buffer);
-    view.setUint32(0, LOCAL_HEADER_SIG, true);
-    view.setUint16(4, VERSION_NEEDED, true);
-    view.setUint16(6, FLAG_UTF8, true);
-    view.setUint16(8, METHOD_DEFLATE, true);
-    view.setUint16(10, this._dosTime, true);
-    view.setUint16(12, this._dosDate, true);
-    view.setUint32(14, crc, true);
-    view.setUint32(18, compSize, true);
-    view.setUint32(22, rawSize, true);
-    view.setUint16(26, nameBytes.length, true);
-    view.setUint16(28, 0, true);
-    header.set(nameBytes, 30);
-
-    this._out.push(header);
-    for (const chunk of compressed) this._out.push(chunk);
-
-    this._entries.push({ nameBytes, crc, compSize, rawSize, offset });
+    this._entries.push({
+      nameBytes,
+      crc,
+      compSize,
+      rawSize,
+      offset,
+      flags: FLAG_UTF8 | FLAG_DATA_DESCRIPTOR
+    });
     return true;
   }
 
@@ -250,7 +274,7 @@ export class ZipBlobWriter {
       view.setUint32(0, CENTRAL_HEADER_SIG, true);
       view.setUint16(4, VERSION_NEEDED, true);
       view.setUint16(6, VERSION_NEEDED, true);
-      view.setUint16(8, FLAG_UTF8, true);
+      view.setUint16(8, entry.flags, true);
       view.setUint16(10, METHOD_DEFLATE, true);
       view.setUint16(12, this._dosTime, true);
       view.setUint16(14, this._dosDate, true);

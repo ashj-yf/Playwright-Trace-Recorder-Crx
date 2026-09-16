@@ -111,21 +111,67 @@ function handleClick(event) {
   }
 }
 
+// Elements whose keystrokes describe a text value. Typing into them is merged
+// into a single fill action (the 'input' event carries the whole value), the
+// same way Playwright codegen collapses a burst of keystrokes.
+function isTextEditable(element) {
+  if (!element || !(element instanceof Element)) return false;
+  if (element.isContentEditable) return true;
+  if (element.tagName === 'TEXTAREA') return true;
+  if (element.tagName === 'INPUT') {
+    const type = (element.getAttribute('type') || 'text').toLowerCase();
+    return ['text', 'search', 'url', 'tel', 'email', 'password', 'number', ''].includes(type);
+  }
+  return false;
+}
+
+// A key that edits the field's text. The resulting 'input' event covers it.
+function isTextEditingKey(key) {
+  return key.length === 1 || key === 'Backspace' || key === 'Delete';
+}
+
+// Bare modifier presses (the Control keydown preceding Control+a, …) carry no
+// action of their own, the way Playwright codegen ignores them.
+const MODIFIER_KEYS = new Set(['Control', 'Shift', 'Meta', 'Alt', 'AltGraph', 'OS']);
+
+// Playwright-style key name for a modifier chord (Control+a, Meta+v, …).
+function chordKey(event) {
+  if (!event.ctrlKey && !event.metaKey && !event.altKey) return null;
+  const parts = [];
+  if (event.ctrlKey) parts.push('Control');
+  if (event.metaKey) parts.push('Meta');
+  if (event.altKey) parts.push('Alt');
+  if (event.shiftKey) parts.push('Shift');
+  parts.push(event.key.length === 1 ? event.key.toLowerCase() : event.key);
+  return parts.join('+');
+}
+
 // Handle keydown events
 function handleKeydown(event) {
   if (!isRecording || isReplaying) return;
-  
-  const selector = getElementSelector(event.target);
+
+  // IME composition (e.g. Chinese/Japanese input): the composing 'input'
+  // events and final fill value already capture the result.
+  if (event.isComposing || event.keyCode === 229) return;
+  // Bare modifier keydowns precede their chord; nothing to record.
+  if (MODIFIER_KEYS.has(event.key)) return;
+
+  const editable = isTextEditable(event.target);
+  const chord = chordKey(event);
+
+  // Plain editing keystrokes in a text field are folded into the fill action.
+  if (editable && !chord && isTextEditingKey(event.key)) return;
+
+  // Printable keys on a non-editable target are not meaningful actions;
+  // special keys (Enter, Tab, Escape, arrows, F-keys) and chords are presses.
+  if (!editable && !chord && event.key.length === 1) return;
+
   const eventData = {
-    type: 'keydown',
-    selector: selector,
-    key: event.key,
-    keyCode: event.keyCode,
-    ctrlKey: event.ctrlKey,
-    shiftKey: event.shiftKey,
-    altKey: event.altKey
+    type: 'press',
+    selector: getElementSelector(event.target),
+    key: chord || event.key
   };
-  
+
   sendEventToBackground(eventData);
 }
 
@@ -150,15 +196,22 @@ function handleScroll(event) {
 // Handle input events
 function handleInput(event) {
   if (!isRecording || isReplaying) return;
-  
+
   try {
-    const selector = getElementSelector(event.target);
-    const eventData = {
-      type: 'input',
-      selector: selector,
-      value: event.target.value
-    };
-    
+    const target = event.target;
+    const selector = getElementSelector(target);
+    const eventData = isTextEditable(target)
+      ? {
+          type: 'fill',
+          selector,
+          value: target.isContentEditable ? (target.textContent || '') : target.value
+        }
+      : {
+          type: 'input',
+          selector,
+          value: target.value
+        };
+
     sendEventToBackground(eventData);
   } catch (e) {
     console.warn('Failed to capture input event:', e);
@@ -168,7 +221,11 @@ function handleInput(event) {
 // Handle change events
 function handleChange(event) {
   if (!isRecording || isReplaying) return;
-  
+
+  // Text fields already produced a fill action carrying the final value;
+  // their change event only fires at blur and would duplicate it.
+  if (isTextEditable(event.target)) return;
+
   try {
     const selector = getElementSelector(event.target);
     const eventData = {
@@ -176,7 +233,7 @@ function handleChange(event) {
       selector: selector,
       value: event.target.value
     };
-    
+
     sendEventToBackground(eventData);
   } catch (e) {
     console.warn('Failed to capture change event:', e);
@@ -269,14 +326,16 @@ async function replayEvent(event) {
       await replayClick(event);
       break;
     
+    case 'press':
     case 'keydown':
       await replayKeydown(event);
       break;
-    
+
     case 'scroll':
       await replayScroll(event);
       break;
-    
+
+    case 'fill':
     case 'input':
     case 'change':
       await replayInput(event);

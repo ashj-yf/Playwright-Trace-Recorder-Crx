@@ -12,7 +12,7 @@ import {
   countRequests,
   clearSession,
   sweepOrphanSessions,
-  putTrace,
+  putTraceArchive,
   deleteTrace as deleteStoredTrace
 } from './traceStore.js';
 
@@ -246,6 +246,7 @@ async function startRecording(name, tabId) {
   activeRecording = rec;
   captureChain = Promise.resolve();
   captureQueueDepth = 0;
+  pendingFill = null;
   console.log(`Recording started: ${name} (tabId=${tabId}, session=${rec.session})`);
 
   // Make sure no boot-time recovery/sweep is still scanning the stores before
@@ -341,6 +342,12 @@ async function stopRecording() {
   if (!activeRecording) {
     throw new Error('Not recording');
   }
+
+  // Settle an open typing burst and let queued captures run while the debugger
+  // is still attached and the recording is still active, so the final Page.fill
+  // action lands with real snapshots instead of being dropped by the guards.
+  settlePendingFill('stop');
+  try { await captureChain; } catch (_) {}
 
   const recording = activeRecording;
   activeRecording = null;
@@ -449,15 +456,16 @@ async function runRecovery(keepSession = null) {
         recovered: true
       };
       const traceInfo = await generatePlaywrightTraceInBrowser(pseudo);
-      const data = await traceInfo.blob.arrayBuffer();
-      await putTrace({
-        id: traceInfo.id,
-        name: traceInfo.name,
-        url: traceInfo.url,
-        timestamp: traceInfo.timestamp,
-        size: traceInfo.size,
-        data
-      });
+      await putTraceArchive(
+        {
+          id: traceInfo.id,
+          name: traceInfo.name,
+          url: traceInfo.url,
+          timestamp: traceInfo.timestamp,
+          size: traceInfo.size
+        },
+        traceInfo.blob
+      );
       await appendTraceMetadata(traceInfo, `${info.name || 'Recording'} (recovered)`);
       console.log(`Recovered unsaved recording "${info.name}" as trace ${traceInfo.id}`);
     } catch (err) {
@@ -613,23 +621,23 @@ async function saveTraceLocally(recording) {
     throw new Error(`generate trace failed: ${err && err.message}`);
   }
 
-  // Persist the archive as inline bytes (ArrayBuffer), not a Blob: an IndexedDB
+  // Persist the archive in fixed-size slices (never the whole archive in the
+  // worker heap), and as ArrayBuffer slices rather than Blobs: an IndexedDB
   // Blob's internal handle breaks after the service worker restarts and later
-  // reads (the panel's Download) reject with "network error". This costs one
-  // archive-size, short-lived copy at save time only.
-  let data;
+  // reads (the panel's Download) reject with "network error".
   try {
-    data = await traceInfo.blob.arrayBuffer();
-    await putTrace({
-      id: traceInfo.id,
-      name: traceInfo.name,
-      url: traceInfo.url,
-      timestamp: traceInfo.timestamp,
-      size: traceInfo.size,
-      data
-    });
+    await putTraceArchive(
+      {
+        id: traceInfo.id,
+        name: traceInfo.name,
+        url: traceInfo.url,
+        timestamp: traceInfo.timestamp,
+        size: traceInfo.size
+      },
+      traceInfo.blob
+    );
   } catch (err) {
-    throw new Error(`putTrace: ${err && err.message}`);
+    throw new Error(`store trace archive: ${err && err.message}`);
   }
 
   try {
@@ -1182,13 +1190,63 @@ async function logEvent(rec, data) {
  * Queue an interaction for recording. Captures run one at a time; when actions
  * arrive faster than snapshots can be taken, the excess is still recorded but
  * without snapshots rather than piling up concurrent CDP work.
+ *
+ * Consecutive fill events on the same element describe one typing burst and
+ * are merged into a single Page.fill action (like Playwright codegen): their
+ * capture job waits on the queue until the burst settles, and only the latest
+ * value is recorded. A different interaction, switching fields, an idle gap or
+ * stopping the recording settles the burst.
  */
+const FILL_IDLE_MS = 400;
+let pendingFill = null;
+
+function settlePendingFill(reason) {
+  const pending = pendingFill;
+  if (!pending || pending.settled) return;
+  pending.settled = true;
+  pending.settleReason = reason;
+  clearTimeout(pending.idleTimer);
+  pending.resolve();
+}
+
 function enqueueAction(event) {
   if (!activeRecording) {
     console.warn('Received event while not recording');
     return;
   }
   const rec = activeRecording;
+
+  if (event.type === 'fill') {
+    if (pendingFill && !pendingFill.settled &&
+        pendingFill.selector === event.selector) {
+      // Same burst: refresh the value its (already queued) job will record.
+      pendingFill.event = event;
+      clearTimeout(pendingFill.idleTimer);
+      pendingFill.idleTimer = setTimeout(() => settlePendingFill('idle'), FILL_IDLE_MS);
+      return;
+    }
+    settlePendingFill('switch');
+
+    const pending = {
+      selector: event.selector,
+      event,
+      settled: false,
+      settleReason: null,
+      resolve: null,
+      idleTimer: setTimeout(() => settlePendingFill('idle'), FILL_IDLE_MS)
+    };
+    pending.settledPromise = new Promise(resolve => { pending.resolve = resolve; });
+    pendingFill = pending;
+
+    captureQueueDepth++;
+    captureChain = captureChain
+      .then(() => recordFillAction(rec, pending))
+      .catch(err => console.warn('Failed to record fill action:', err))
+      .then(() => { captureQueueDepth--; });
+    return;
+  }
+
+  settlePendingFill('interrupt');
 
   const withSnapshots = captureQueueDepth < LIMITS.maxQueuedCaptures &&
     rec.eventCount < LIMITS.maxEvents;
@@ -1197,6 +1255,18 @@ function enqueueAction(event) {
     .then(() => recordAction(rec, event, withSnapshots))
     .catch(err => console.warn('Failed to record action:', err))
     .then(() => { captureQueueDepth--; });
+}
+
+async function recordFillAction(rec, pending) {
+  await pending.settledPromise;
+  // The recording may have been stopped while the burst was settling.
+  if (rec !== activeRecording) return;
+  // Snapshot eligibility is evaluated now, not when the first keystroke landed:
+  // this job occupied a queue slot while waiting for the burst to settle, so the
+  // enqueue-time depth would deny snapshots to actions queued behind typing.
+  const withSnapshots = captureQueueDepth < LIMITS.maxQueuedCaptures &&
+    rec.eventCount < LIMITS.maxEvents;
+  await recordAction(rec, pending.event, withSnapshots);
 }
 
 async function recordAction(rec, event, withSnapshots) {
@@ -1253,7 +1323,11 @@ async function recordAction(rec, event, withSnapshots) {
     startTime: timestamp,
     method: event.type,
     class: 'Page',
-    params: { selector: event.selector || '', value: event.value || '' },
+    params: {
+      selector: event.selector || '',
+      ...(event.value != null ? { value: event.value } : {}),
+      ...(event.key != null ? { key: event.key } : {})
+    },
     pageId: 'page1',
     timestamp,
     beforeSnapshotIds,

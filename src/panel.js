@@ -2,7 +2,7 @@
 
 'use strict';
 
-import { getTrace } from './traceStore.js';
+import { readTraceBlob } from './traceStore.js';
 
 const recordBtn          = document.getElementById('recordBtn');
 const statusBadge        = document.getElementById('statusBadge');
@@ -330,17 +330,16 @@ async function downloadTrace(trace) {
 }
 
 /**
- * Read the archive directly out of IndexedDB. Older traces predate that and are
- * still base64 in chrome.storage.local, so fall back to asking the worker.
+ * Reassemble the archive directly out of IndexedDB. Current archives live in
+ * fixed-size slices that fold into a disk-backed Blob a few at a time, so even
+ * a multi-hundred-megabyte trace is never resident in this page's heap. Older
+ * archives predate slices (inline `data`, v2) or base64 in chrome.storage.local
+ * (v1) and are handled by fallbacks.
  */
 async function resolveTraceBlob(id) {
   try {
-    const record = await getTrace(id);
-    // Archives are stored as inline bytes (durable across service-worker
-    // restarts); wrap them into a Blob for the download object URL.
-    if (record && record.data) {
-      return new Blob([record.data], { type: 'application/zip' });
-    }
+    const blob = await readTraceBlob(id);
+    if (blob && blob.size > 0) return blob;
   } catch (err) {
     console.warn('Could not read trace from IndexedDB:', err);
   }
