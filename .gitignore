@@ -27,9 +27,9 @@ tests/user-data/
 tests/playwright-report/
 tests/test-results.json
 
-# Test results (generated traces)
-tests/test-results/*.zip
-tests/test-results/.last-run.json
+# Test results (generated traces, screenshots, run metadata)
+test-results/
+tests/test-results/
 
 # Screenshots and assets (can be removed if not needed)
 screenshots/

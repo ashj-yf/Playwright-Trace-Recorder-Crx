@@ -1,549 +1,608 @@
 /**
- * Browser-compatible Playwright trace generator for Chrome extension service workers.
- * Ports traceGenerator.js from Node.js to browser APIs:
- *  - crypto.subtle.digest('SHA-1') instead of Node crypto module
- *  - self.JSZip (loaded via importScripts) instead of require('jszip')
- *  - crypto.randomUUID() instead of uuid package
- *  - Returns Uint8Array instead of writing to disk
+ * Playwright trace generator for Chrome extension service workers.
+ *
+ * Streams the archive out instead of building it in memory:
+ *  - `trace.trace` is emitted line by line through a ZipBlobWriter stream, so the
+ *    full trace text never exists as a single string
+ *  - DOM snapshots are read back from IndexedDB one frame at a time, parsed,
+ *    emitted, then released — peak heap is one snapshot, not all of them
+ *  - events, request records and resources are streamed out of IndexedDB too
+ *
+ * Resources are already content-addressed (sha1) by the recorder, so no hashing
+ * or base64 buffering happens here.
  */
 
-async function sha1Hex(buffer) {
-  const hashBuffer = await crypto.subtle.digest('SHA-1', buffer);
-  return Array.from(new Uint8Array(hashBuffer))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
+import { ZipBlobWriter } from './zipStream.js';
+import {
+  readSnapshot,
+  readResource,
+  readEvents,
+  readRequests,
+  listResourceNames
+} from './traceStore.js';
+const RESOURCE_PREFIX = 'resources/';
+const LINE_CHUNK_BYTES = 64 * 1024;
+
+/** Coalesce many small lines into larger chunks before they hit the compressor. */
+async function* chunkLines(lines) {
+  let buffer = '';
+  for await (const line of lines) {
+    buffer += line;
+    if (buffer.length >= LINE_CHUNK_BYTES) {
+      yield buffer;
+      buffer = '';
+    }
+  }
+  if (buffer) yield buffer;
 }
 
-function base64ToUint8Array(base64) {
-  const binaryStr = atob(base64);
-  const bytes = new Uint8Array(binaryStr.length);
-  for (let i = 0; i < binaryStr.length; i++) {
-    bytes[i] = binaryStr.charCodeAt(i);
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
   }
-  return bytes;
+  return btoa(binary);
 }
 
 /**
- * Generates a Playwright-compatible trace zip in the browser (service worker).
- * @param {Object} tracePayload - Payload from the extension recording
- * @returns {Promise<{zipData: Uint8Array, id: string, name: string, url: string, timestamp: number, eventCount: number, size: number}>}
+ * Builds the subtree-reference encoder used for ONE FRAME of one recording.
+ * Back-reference indices are per frameId in the viewer, so each frame gets its
+ * own instance; the state (hash table + snapshot counter) is otherwise per
+ * recording.
+ *
+ * Exported for tests: the round-trip check feeds real snapshots through this and
+ * asserts the trace viewer renders them identically to the un-referenced form.
+ *
+ * Two invariants make this safe, both dictated by the viewer's
+ * `snapshotNodes()` (utils/isomorphic/trace/snapshotRenderer.js):
+ *
+ *  1. Indices come from a post-order walk of the *emitted* tree that numbers
+ *     text nodes and elements and never descends into a reference. So indices
+ *     have to be handed out top-down while the hashes that decide what is
+ *     unchanged have to be computed bottom-up — hence two passes.
+ *  2. A reference points at the snapshot that last *materialized* the subtree,
+ *     encoded as `[[snapshotsBack, nodeIndex]]`.
  */
-async function generatePlaywrightTraceInBrowser(tracePayload) {
+function createSubtreeReferencer() {
+  /** Subtree hash → [snapshotIndex, nodeIndex] where it was last materialized. */
+  const materialized = new Map();
+  let snapshotIndex = 0;
+
+  // Bounds the table on a long recording of a large page. Past this, subtrees are
+  // still emitted correctly, just in full — declining to register a hash only
+  // ever costs compression, never correctness.
+  const MAX_REF_ENTRIES = 200000;
+
+  /**
+   * 96-bit FNV-1a-style digest, three accumulators in one pass over `text`.
+   * A 32-bit hash would eventually collide across a long recording and silently
+   * swap one subtree for another, so the extra width buys real safety here.
+   */
+  function hash96(text) {
+    let h1 = 0x811c9dc5, h2 = 0x01000193, h3 = 0x9e3779b9;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 0x01000193);
+      h2 = Math.imul(h2 ^ c, 0x85ebca6b);
+      h3 = Math.imul(h3 ^ c, 0xc2b2ae35);
+    }
+    return (h1 >>> 0).toString(36) + '.' + (h2 >>> 0).toString(36) + '.' +
+      (h3 >>> 0).toString(36) + '.' + text.length.toString(36);
+  }
+
+  function hashTree(node) {
+    if (typeof node === 'string') return { hash: hash96('t:' + node) };
+    if (!Array.isArray(node) || typeof node[0] !== 'string') return { hash: null };
+    const children = [];
+    let acc = 'e:' + node[0] + ':' + JSON.stringify(node[1] || {});
+    for (let i = 2; i < node.length; i++) {
+      const child = hashTree(node[i]);
+      children.push(child);
+      acc += '|' + child.hash;
+    }
+    return { hash: hash96(acc), children };
+  }
+
+  function encodeNode(node, hashes, counter) {
+    const known = hashes.hash === null ? undefined : materialized.get(hashes.hash);
+    if (known) return [[snapshotIndex - known[0], known[1]]];
+
+    const remember = () => {
+      if (materialized.size < MAX_REF_ENTRIES) {
+        materialized.set(hashes.hash, [snapshotIndex, counter.next]);
+      }
+      counter.next++;
+    };
+
+    if (typeof node === 'string') {
+      remember();
+      return node;
+    }
+    if (hashes.hash === null) return node;
+
+    const out = [node[0], node[1]];
+    for (let i = 2; i < node.length; i++) {
+      out.push(encodeNode(node[i], hashes.children[i - 2], counter));
+    }
+    remember();
+    return out;
+  }
+
+  return function referenceUnchangedSubtrees(html) {
+    const encoded = encodeNode(html, hashTree(html), { next: 0 });
+    snapshotIndex++;
+    return encoded;
+  };
+}
+
+/**
+ * Rewrite a parsed snapshot tree into its viewer-safe emitted form:
+ *  - iframe elements tagged at capture with `__pw_frame__` get the viewer's
+ *    snapshot route as their src (`#<frameId>/<snapshotName>`),
+ *  - scripts can never execute: external src moves to data-src, inline scripts
+ *    are renamed to invisible X-SCRIPT elements while keeping their source,
+ *  - prefetched/preloaded scripts lose their executable rel.
+ * Mutates in place — the parsed tree is discarded right after serialization.
+ */
+function neutralizeScripts(node, snapshotName) {
+  if (!Array.isArray(node) || node.length < 2) return node;
+  const tag = node[0];
+  const attrs = node[1];
+  if (attrs && typeof attrs === 'object') {
+    if (attrs.__pw_frame__) {
+      attrs.src = `#${attrs.__pw_frame__}/${snapshotName}`;
+      delete attrs.__pw_frame__;
+    }
+    if (tag === 'LINK') {
+      const rel = attrs.rel || '';
+      const as = attrs.as || '';
+      if (rel.includes('modulepreload') || (rel.includes('preload') && as === 'script')) {
+        if (attrs.href) attrs['data-js-href'] = attrs.href;
+        attrs.rel = rel.replace('modulepreload', '').replace('preload', '').trim();
+      }
+    } else if (tag === 'STYLE') {
+      // Not a real stylesheet URL — inline stylesheet text travels inside the
+      // snapshot itself, and the viewer only resolves external <link> sheets.
+      delete attrs['data-href'];
+    } else if (tag === 'SCRIPT') {
+      if (attrs.src) {
+        attrs['data-src'] = attrs.src;
+        delete attrs.src;
+      } else {
+        // Inline script: preserve the source text but make it unexecutable and
+        // invisible when the snapshot DOM is rendered.
+        node[0] = 'X-SCRIPT';
+        attrs.style = attrs.style ? `display:none!important;${attrs.style}` : 'display:none!important';
+      }
+    }
+  }
+  for (let i = 2; i < node.length; i++) {
+    if (Array.isArray(node[i])) neutralizeScripts(node[i], snapshotName);
+  }
+  return node;
+}
+
+/**
+ * Emits a Playwright trace zip for a finished (or recovered) recording.
+ *
+ * @param {Object} recording Recorder state; everything bulky is read from IDB.
+ * @returns {Promise<{id: string, blob: Blob, name: string, url: string,
+ *   timestamp: number, eventCount: number, size: number}>}
+ */
+async function generatePlaywrightTraceInBrowser(recording) {
   const id = crypto.randomUUID();
-  const zip = new self.JSZip();
-
-  const traceTraceLines = [];
-  const traceNetworkLines = [];
-
-  const addedResources = new Set();
-  const resourcesFolder = zip.folder('resources');
+  const session = recording.session;
+  const zip = new ZipBlobWriter();
 
   const nowWall = Date.now();
-  const baseTime = tracePayload.events.length > 0
-    ? (tracePayload.events[0].timestamp || tracePayload.events[0].time || tracePayload.events[0].startTime || nowWall)
-    : nowWall;
-  const startTime = baseTime;
+  const mainFrameId = recording.mainFrameId || ('frame@' + id.substring(0, 8));
+  const viewport = recording.viewport || { width: 1280, height: 720 };
 
-  const relTime = (absTime) => Math.max(0, absTime - baseTime);
+  // Base time is the first event's timestamp. Events live in IDB, so prime the
+  // iterator before opening the trace stream.
+  const eventIterator = readEvents(session)[Symbol.asyncIterator]();
+  const firstEventResult = await eventIterator.next();
+  const baseTime = !firstEventResult.done
+    ? (firstEventResult.value.timestamp || firstEventResult.value.time ||
+       firstEventResult.value.startTime || recording.startTime || nowWall)
+    : (recording.startTime || nowWall);
+  const relTime = absTime => Math.max(0, absTime - baseTime);
 
-  // 1. context-options event
-  traceTraceLines.push(JSON.stringify({
-    version: 6,
-    type: 'context-options',
-    origin: 'library',
-    browserName: 'chromium',
-    channel: '',
-    options: {
-      viewport: tracePayload.viewport || { width: 1280, height: 720 },
-      deviceScaleFactor: 1,
-      isMobile: false,
-      hasTouch: false,
-      javaScriptEnabled: true
-    },
-    platform: navigator.platform || 'unknown',
-    wallTime: startTime,
-    monotonicTime: 0,
-    sdkLanguage: 'javascript',
-    testIdAttributeName: 'data-testid',
-    internal: {}
-  }));
-
-  // 2. Base IDs
   const pageId = 'page@' + id.substring(0, 8);
-  const mainFrameId = 'frame@' + id.substring(0, 8);
 
-  // 3. metadata.json
-  const metadata = {
+  // ── metadata.json ───────────────────────────────────────────────────────────
+  await zip.addFile('metadata.json', JSON.stringify({
     version: 6,
     startTime: 0,
     endTime: relTime(nowWall),
-    wallTime: startTime,
+    wallTime: baseTime,
     browserName: 'chromium',
-    options: {
-      viewport: tracePayload.viewport || { width: 1280, height: 720 },
-      deviceScaleFactor: 1,
-      isMobile: false,
-    },
+    options: { viewport, deviceScaleFactor: 1, isMobile: false },
     pages: [{
       pageId,
-      url: tracePayload.url || '',
-      title: tracePayload.name || 'Ventriloquist Trace'
+      url: recording.url || '',
+      title: recording.name || 'Playwright Trace'
     }]
+  }, null, 2));
+
+  // Stylesheets are deduplicated per recording, so every snapshot shares the
+  // same override list — build it once instead of per snapshot.
+  const resourceOverrides = [];
+  for (const [href, resourceName] of (recording.cssRefs || new Map())) {
+    resourceOverrides.push({ url: href, sha1: resourceName });
+  }
+
+  // One referencer (snapshot counter + subtree hash table) per frame.
+  const referencers = new Map();
+  const referencerFor = frameId => {
+    let ref = referencers.get(frameId);
+    if (!ref) {
+      ref = createSubtreeReferencer();
+      referencers.set(frameId, ref);
+    }
+    return ref;
   };
-  zip.file('metadata.json', JSON.stringify(metadata, null, 2));
 
-  // 4. event: pageCreated
-  traceTraceLines.push(JSON.stringify({
-    type: 'event',
-    time: relTime(startTime),
-    class: 'BrowserContext',
-    method: 'newPage',
-    params: { page: { guid: pageId } },
-    pageId: pageId,
-    internal: {}
-  }));
-
-  // 5. event: navigated
-  if (tracePayload.url) {
-    traceTraceLines.push(JSON.stringify({
-      type: 'event',
-      time: relTime(startTime),
-      class: 'Frame',
-      method: 'navigated',
-      params: { url: tracePayload.url, name: '' },
-      pageId: pageId,
-      internal: {}
-    }));
-  }
-
-  // Pre-process network events into requests map
-  const networkRequests = new Map();
-  for (const event of tracePayload.events) {
-    if (event.type === 'cdp-network') {
-      const reqId = event.params?.requestId;
-      if (!reqId) continue;
-      if (!networkRequests.has(reqId)) {
-        networkRequests.set(reqId, {
-          url: '', method: '', requestHeaders: [],
-          status: 0, statusText: '', responseHeaders: [], mimeType: '',
-          timestamp: event.timestamp
-        });
-      }
-      const req = networkRequests.get(reqId);
-      if (event.method === 'Network.requestWillBeSent') {
-        req.url = event.params.request?.url || '';
-        req.method = event.params.request?.method || 'GET';
-        req.requestHeaders = Object.entries(event.params.request?.headers || {}).map(([n, v]) => ({ name: n, value: String(v) }));
-        req.postData = event.params.request?.postData;
-      } else if (event.method === 'Network.responseReceived') {
-        req.status = event.params.response?.status || 0;
-        req.statusText = event.params.response?.statusText || '';
-        req.responseHeaders = Object.entries(event.params.response?.headers || {}).map(([n, v]) => ({ name: n, value: String(v) }));
-        req.mimeType = event.params.response?.mimeType || '';
-      }
-    } else if (event.type === 'cdp-network-body') {
-      const req = networkRequests.get(event.requestId);
-      if (req && event.body) {
-        req.body = event.body;
-        req.base64Encoded = event.base64Encoded;
-      }
+  async function loadSnapshotDom(snapshotId) {
+    if (snapshotId === null || snapshotId === undefined) return null;
+    let json;
+    try {
+      json = await readSnapshot(snapshotId);
+    } catch (err) {
+      console.warn('[TraceGen] Could not read snapshot', snapshotId, err);
+      return null;
     }
-  }
-
-  // Helper function to get file extension from MIME type (matches Ventriloquist implementation)
-  function getResourceExtensionFromMime(mime) {
-    if (!mime) return '';
-    if (mime.includes('image/jpeg')) return '.jpeg';
-    if (mime.includes('image/png')) return '.png';
-    if (mime.includes('image/webp')) return '.webp';
-    if (mime.includes('image/gif')) return '.gif';
-    if (mime.includes('image/svg+xml')) return '.svg';
-    if (mime.includes('video/mp4')) return '.mp4';
-    if (mime.includes('audio/mpeg')) return '.mp3';
-    if (mime.includes('font/woff2')) return '.woff2';
-    if (mime.includes('font/woff')) return '.woff';
-    if (mime.includes('font/ttf')) return '.ttf';
-    if (mime.includes('css')) return '.css';
-    if (mime.includes('javascript')) return '.js';
-    if (mime.includes('json')) return '.json';
-    if (mime.includes('html')) return '.html';
-    return '';
-  }
-
-  // Generate resource-snapshot entries for trace.network
-  for (const [, req] of networkRequests.entries()) {
-    if (!req.url || !req.url.startsWith('http')) continue;
-
-    let responseSha1 = undefined;
-    if (req.body) {
-      const bodyBuf = req.base64Encoded
-        ? base64ToUint8Array(req.body)
-        : new TextEncoder().encode(req.body);
-      const pureSha1 = await sha1Hex(bodyBuf);
-      
-      // Get file extension from MIME type (matches Ventriloquist pattern)
-      const ext = getResourceExtensionFromMime(req.mimeType);
-      responseSha1 = pureSha1 + ext;
-      
-      if (!addedResources.has(responseSha1)) {
-        addedResources.add(responseSha1);
-        // Add extension to resource filename
-        resourcesFolder.file(responseSha1, bodyBuf);
-      }
-    }
-
-    traceNetworkLines.push(JSON.stringify({
-      type: 'resource-snapshot',
-      snapshot: {
-        pageref: pageId,
-        startedDateTime: new Date(req.timestamp || startTime).toISOString(),
-        time: relTime(req.timestamp || startTime),
-        request: {
-          url: req.url,
-          method: req.method,
-          headers: req.requestHeaders,
-          postData: req.postData || undefined
-        },
-        response: {
-          status: req.status,
-          statusText: req.statusText,
-          headers: req.responseHeaders,
-          content: {
-            mimeType: req.mimeType,
-            size: req.body ? req.body.length : 0,
-            _sha1: responseSha1
-          }
-        }
-      },
-      pageId: pageId
-    }));
-  }
-
-  // Process resources first to get true SHA1 hashes
-  const resourceSha1Map = new Map();
-  const resourceBase64Map = new Map();
-
-  if (tracePayload.resources && Array.isArray(tracePayload.resources)) {
-    for (const res of tracePayload.resources) {
-      // Skip JavaScript files - they are not needed in trace resources
-      if (res.sha1 && res.data && !addedResources.has(res.sha1)) {
-        // Check if this is a JavaScript resource by looking at the sha1 filename
-        if (res.sha1.includes('.js') || res.sha1.startsWith('script-')) continue;
-        
-        let base64Data = res.data;
-        if (base64Data.startsWith('data:')) {
-          base64Data = base64Data.split(',')[1];
-        }
-
-        const bodyBuf = base64ToUint8Array(base64Data);
-        const trueSha1 = await sha1Hex(bodyBuf);
-        resourceSha1Map.set(res.sha1, trueSha1);
-        resourceBase64Map.set(trueSha1, base64Data);
-
-        if (!addedResources.has(trueSha1)) {
-          addedResources.add(trueSha1);
-          // Extract just the filename to avoid nested directories
-          const fileName = trueSha1.split('/').pop() || trueSha1;
-          console.log('[TraceGen] Storing resource from tracePayload.resources:', res.sha1, '->', fileName);
-          resourcesFolder.file(fileName, bodyBuf);
-        } else {
-          console.log('[TraceGen] Resource already stored (tracePayload.resources):', res.sha1);
-        }
-      }
+    if (!json) return null;
+    try {
+      return JSON.parse(json);
+    } catch (_) {
+      return null;
     }
   }
 
   /**
-   * Emit a frame-snapshot trace event (Playwright trace format).
-   * domSnap.html MUST be a NodeSnapshot tree (Array).
+   * Build every frame's frame-snapshot line for one action stage
+   * (before/action/after). Each entry in idsMap is one frame's snapshot id.
    */
-  async function emitFrameSnapshot(snapshotName, domSnap, callId, snapTime) {
-    if (!domSnap) return false;
-    if (typeof domSnap.html === 'string') return false;
-    if (!Array.isArray(domSnap.html)) return false;
+  async function buildFrameLines(snapshotName, idsMap, callId, snapTime) {
+    const entries = Object.entries(idsMap || {});
+    entries.sort(([a], [b]) =>
+      (a === mainFrameId ? -1 : 0) - (b === mainFrameId ? -1 : 0));
 
-    // Initialize resourceOverrides first (will be populated below)
-    const resourceOverrides = [];
+    const lines = [];
+    for (const [frameId, snapshotId] of entries) {
+      const domSnap = await loadSnapshotDom(snapshotId);
+      if (!domSnap || !Array.isArray(domSnap.html)) continue;
 
-    // Build stylesheet resource map for href replacement
-    const stylesheetResourceMap = new Map();
-    
-    // Process resourceOverrides from inline <style> elements
-    if (Array.isArray(domSnap.resourceOverrides)) {
-      for (const override of domSnap.resourceOverrides) {
-        if (override.url && typeof override.content === 'string') {
-          // Store sha1 reference for trace viewer to fetch CSS dynamically
-          const buf = new TextEncoder().encode(override.content);
-          const sha1 = await sha1Hex(buf);
-          
-          // Store CSS file with true SHA1 hash
-          const cssPath = sha1 + '.css';
-          if (!addedResources.has(sha1)) {
-            addedResources.add(sha1);
-            resourcesFolder.file(cssPath, buf);
-          }
-          
-          resourceOverrides.push({ url: override.url, sha1: sha1 + ".css" });
-          stylesheetResourceMap.set(override.url, 'resources/' + cssPath);
-        } else if (override.url && typeof override.content === 'number') {
-          resourceOverrides.push({ url: override.url, ref: override.content });
+      const effectiveFrameId = domSnap.frameId || frameId;
+      const html = referencerFor(effectiveFrameId)(
+        neutralizeScripts(domSnap.html, snapshotName));
+
+      lines.push(JSON.stringify({
+        type: 'frame-snapshot',
+        snapshot: {
+          callId,
+          snapshotName,
+          pageId,
+          frameId: effectiveFrameId,
+          frameUrl: domSnap.url || recording.url || '',
+          doctype: domSnap.doctype || 'html',
+          html,
+          viewport: domSnap.viewport || viewport,
+          timestamp: snapTime,
+          wallTime: snapTime,
+          collectionTime: 0,
+          resourceOverrides,
+          isMainFrame: !!domSnap.isMainFrame || effectiveFrameId === mainFrameId
         }
-      }
+      }) + '\n');
     }
+    return lines;
+  }
 
-    // Also process stylesheetResources from the extension
-    if (Array.isArray(domSnap.stylesheetResources)) {
-      for (const sheet of domSnap.stylesheetResources) {
-        if (sheet.href && sheet.cssContent) {
-          const buf = new TextEncoder().encode(sheet.cssContent);
-          const sha1 = await sha1Hex(buf);
-          
-          // Store CSS file with true SHA1 hash
-          const cssPath = sha1 + '.css';
-          if (!addedResources.has(sha1)) {
-            addedResources.add(sha1);
-            resourcesFolder.file(cssPath, buf);
-          }
-          
-          resourceOverrides.push({ url: sheet.href, sha1: sha1 + ".css" });
-          stylesheetResourceMap.set(sheet.href, 'resources/' + cssPath);
-        }
-      }
-    }
+  // ── trace.trace ─────────────────────────────────────────────────────────────
+  let eventCount = 0;
 
-    // Clone and update HTML tree - only replace JS links to prevent execution
-    function updateHtmlTree(node) {
-      if (!Array.isArray(node) || node.length < 2) return node;
-      
-      const [tag, attrs, ...children] = node;
-      
-      // Only replace JavaScript-related links (modulepreload, script preload, etc.)
-      if (tag === 'LINK' && attrs) {
-        const rel = attrs.rel || '';
-        const as = attrs.as || '';
-        
-        // Replace modulepreload and script preload links to prevent JS execution
-        if (rel.includes('modulepreload') || (rel.includes('preload') && as === 'script')) {
-          const href = attrs.href;
-          if (href) {
-            // Store original href and remove rel to prevent JS loading
-            attrs['data-js-href'] = href;
-            if (rel.includes('modulepreload')) {
-              attrs.rel = rel.replace('modulepreload', '').trim();
-            }
-            if (rel.includes('preload') && as === 'script') {
-              attrs.rel = rel.replace('preload', '').trim();
-            }
-          }
-        }
-      } else if (tag === 'STYLE' && attrs) {
-        // Remove data-href from inline styles - trace viewer will fetch the CSS
-        if (attrs['data-href']) {
-          delete attrs['data-href'];
-        }
-      } else if (tag === 'SCRIPT' && attrs) {
-        // Remove src attribute to prevent JS loading
-        if (attrs.src) {
-          attrs['data-src'] = attrs.src;
-          delete attrs.src;
-        }
-      }
-      
-      // Recursively update children
-      const updatedChildren = children.map(child => {
-        if (Array.isArray(child)) return updateHtmlTree(child);
-        return child;
-      });
-      
-      return [tag, attrs, ...updatedChildren];
-    }
+  async function* traceLines() {
+    yield JSON.stringify({
+      version: 6,
+      type: 'context-options',
+      origin: 'library',
+      browserName: 'chromium',
+      channel: '',
+      options: {
+        viewport,
+        deviceScaleFactor: 1,
+        isMobile: false,
+        hasTouch: false,
+        javaScriptEnabled: true
+      },
+      platform: navigator.platform || 'unknown',
+      wallTime: baseTime,
+      monotonicTime: 0,
+      sdkLanguage: 'javascript',
+      testIdAttributeName: 'data-testid',
+      internal: {}
+    }) + '\n';
 
-    const updatedHtml = updateHtmlTree(domSnap.html || ['HTML', {}, ['HEAD'], ['BODY']]);
-
-    const snapshotObj = {
-      callId,
-      snapshotName,
+    yield JSON.stringify({
+      type: 'event',
+      time: relTime(baseTime),
+      class: 'BrowserContext',
+      method: 'newPage',
+      params: { page: { guid: pageId } },
       pageId,
-      frameId: mainFrameId,
-      frameUrl: domSnap.url || tracePayload.url || '',
-      doctype: domSnap.doctype || 'html',
-      html: updatedHtml,
-      viewport: domSnap.viewport || tracePayload.viewport || { width: 1280, height: 720 },
-      timestamp: snapTime,
-      wallTime: snapTime,
-      collectionTime: 0,
-      resourceOverrides,
-      isMainFrame: true
-    };
+      internal: {}
+    }) + '\n';
 
-    traceTraceLines.push(JSON.stringify({
-      type: 'frame-snapshot',
-      snapshot: snapshotObj
-    }));
-
-    return true;
-  }
-
-  // Process user action events (before/after pairs)
-  const beforeEventMap = new Map();
-  let actionIndex = 0;
-
-  for (const event of tracePayload.events) {
-    if (!event.type) continue;
-    if (event.type === 'cdp-network' || event.type === 'cdp-network-body') continue;
-
-    const eventTime = event.timestamp || event.time || event.startTime || nowWall;
-
-    if (event.type === 'before') {
-      actionIndex++;
-      const actionId = event.callId || `action-${actionIndex}`;
-      beforeEventMap.set(actionId, event);
-
-      const domBefore = event.domSnapshots?.before || null;
-      const domAction = event.domSnapshots?.action || null;
-      const beforeSnapshotName = `before@${actionId}`;
-      const inputSnapshotName = `action@${actionId}`;
-
-      if (domBefore && Array.isArray(domBefore.html)) {
-        await emitFrameSnapshot(beforeSnapshotName, domBefore, actionId, relTime(eventTime));
-      }
-
-      traceTraceLines.push(JSON.stringify({
-        type: 'before',
-        callId: actionId,
-        startTime: relTime(eventTime),
-        apiName: `${event.class || 'Page'}.${event.method || 'click'}`,
-        class: event.class || 'Page',
-        method: event.method || 'click',
-        params: event.params || {},
-        pageId: pageId,
-        wallTime: eventTime,
-        beforeSnapshot: beforeSnapshotName,
-        internal: {}
-      }));
-
-      if (domAction && Array.isArray(domAction.html)) {
-        await emitFrameSnapshot(inputSnapshotName, domAction, actionId, relTime(eventTime));
-      }
-      traceTraceLines.push(JSON.stringify({
-        type: 'input',
-        callId: actionId,
-        inputSnapshot: inputSnapshotName
-      }));
-
-    } else if (event.type === 'after') {
-      const actionId = event.callId || `action-${actionIndex}`;
-      const beforeEvent = beforeEventMap.get(actionId);
-      const snapTime = relTime(event.endTime || eventTime);
-
-      const domAfter = event.domAfterSnapshot || null;
-      const afterSnapshotName = (domAfter && Array.isArray(domAfter.html))
-        ? `after@${actionId}` : undefined;
-      if (afterSnapshotName) {
-        await emitFrameSnapshot(afterSnapshotName, domAfter, actionId, snapTime);
-      }
-
-      const hasDomSnapshots = (
-        (beforeEvent?.domSnapshots?.before && Array.isArray(beforeEvent.domSnapshots.before.html)) ||
-        (beforeEvent?.domSnapshots?.action && Array.isArray(beforeEvent.domSnapshots.action.html)) ||
-        (domAfter && Array.isArray(domAfter.html))
-      );
-
-      const afterEvent = {
-        type: 'after',
-        callId: actionId,
-        endTime: snapTime,
-        wallTime: event.endTime || eventTime,
-        afterSnapshot: afterSnapshotName,
-        internal: {}
-      };
-
-      const attachments = [];
-      if (event.attachments && Array.isArray(event.attachments)) {
-        for (const att of event.attachments) {
-          if (att.sha1) {
-            const trueSha1 = resourceSha1Map.get(att.sha1) || att.sha1;
-
-            traceTraceLines.push(JSON.stringify({
-              type: 'screencast-frame',
-              pageId: pageId,
-              sha1: trueSha1,
-              width: tracePayload.viewport?.width || 1280,
-              height: tracePayload.viewport?.height || 720,
-              timestamp: snapTime,
-              frameSwapWallTime: event.endTime || eventTime
-            }));
-
-            if (!hasDomSnapshots) {
-              const b64 = resourceBase64Map.get(trueSha1);
-              if (b64) {
-                const fallbackSnap = {
-                  doctype: 'html',
-                  html: ['HTML', {},
-                    ['HEAD', {}],
-                    ['BODY', { style: 'margin:0;overflow:hidden;background:#0f0f0f;display:flex;align-items:center;justify-content:center;height:100vh;' },
-                      ['IMG', { src: `data:image/jpeg;base64,${b64}`, style: 'max-width:100%;max-height:100%;object-fit:contain;' }]
-                    ]
-                  ],
-                  url: tracePayload.url || '',
-                  viewport: tracePayload.viewport || { width: 1280, height: 720 }
-                };
-                const fbBefore = `before@${actionId}`;
-                const fbAction = `action@${actionId}`;
-                const fbAfter = `after@${actionId}`;
-                await emitFrameSnapshot(fbBefore, fallbackSnap, actionId, snapTime);
-                await emitFrameSnapshot(fbAction, fallbackSnap, actionId, snapTime);
-                await emitFrameSnapshot(fbAfter, fallbackSnap, actionId, snapTime);
-                afterEvent.afterSnapshot = fbAfter;
-              }
-            }
-
-            attachments.push({
-              name: att.name || 'screenshot',
-              contentType: att.contentType || 'image/jpeg',
-              sha1: trueSha1
-            });
-          }
-        }
-      }
-
-      if (attachments.length > 0) {
-        afterEvent.attachments = attachments;
-      }
-
-      traceTraceLines.push(JSON.stringify(afterEvent));
-
-    } else if (event.type === 'console') {
-      traceTraceLines.push(JSON.stringify({
+    if (recording.url) {
+      yield JSON.stringify({
         type: 'event',
-        time: relTime(eventTime),
-        class: 'Page',
-        method: 'console',
-        params: {
-          type: event.messageType || 'log',
-          text: event.text || '',
-          location: event.location || { url: '', lineNumber: 0, columnNumber: 0 }
-        },
-        pageId: pageId,
+        time: relTime(baseTime),
+        class: 'Frame',
+        method: 'navigated',
+        params: { url: recording.url, name: '' },
+        pageId,
         internal: {}
-      }));
+      }) + '\n';
+    }
+
+    let actionIndex = 0;
+    const pendingActions = new Map();
+
+    // Continue from the primed iterator.
+    const events = (async function* () {
+      if (!firstEventResult.done) yield firstEventResult.value;
+      for await (const value of eventIterator) yield value;
+    })();
+
+    for await (const event of events) {
+      if (!event || !event.type) continue;
+      eventCount++;
+      const eventTime = event.timestamp || event.time || event.startTime || nowWall;
+
+      if (event.type === 'before') {
+        actionIndex++;
+        const actionId = event.callId || `action-${actionIndex}`;
+        const beforeName = `before@${actionId}`;
+        const actionName = `action@${actionId}`;
+
+        const beforeLines = await buildFrameLines(
+          beforeName, event.beforeSnapshotIds, actionId, relTime(eventTime));
+        for (const line of beforeLines) yield line;
+
+        yield JSON.stringify({
+          type: 'before',
+          callId: actionId,
+          startTime: relTime(eventTime),
+          apiName: `${event.class || 'Page'}.${event.method || 'click'}`,
+          class: event.class || 'Page',
+          method: event.method || 'click',
+          params: event.params || {},
+          pageId,
+          wallTime: eventTime,
+          beforeSnapshot: beforeName,
+          internal: {}
+        }) + '\n';
+
+        const actionLines = await buildFrameLines(
+          actionName, event.actionSnapshotIds, actionId, relTime(eventTime));
+        for (const line of actionLines) yield line;
+
+        yield JSON.stringify({
+          type: 'input',
+          callId: actionId,
+          inputSnapshot: actionName
+        }) + '\n';
+
+        pendingActions.set(actionId, {
+          hasDom: beforeLines.length > 0 || actionLines.length > 0
+        });
+
+      } else if (event.type === 'after') {
+        const actionId = event.callId || `action-${actionIndex}`;
+        const pending = pendingActions.get(actionId);
+        pendingActions.delete(actionId);
+        const snapTime = relTime(event.endTime || eventTime);
+
+        const afterName = `after@${actionId}`;
+        const afterLines = await buildFrameLines(
+          afterName, event.afterSnapshotIds, actionId, snapTime);
+        for (const line of afterLines) yield line;
+
+        const hasDomSnapshots =
+          (pending && pending.hasDom) || afterLines.length > 0;
+
+        const afterEvent = {
+          type: 'after',
+          callId: actionId,
+          endTime: snapTime,
+          wallTime: event.endTime || eventTime,
+          afterSnapshot: afterLines.length > 0 ? afterName : undefined,
+          internal: {}
+        };
+
+        const attachments = [];
+        for (const att of (event.attachments || [])) {
+          if (!att.resource) continue;
+
+          yield JSON.stringify({
+            type: 'screencast-frame',
+            pageId,
+            sha1: att.resource,
+            width: att.width || viewport.width,
+            height: att.height || viewport.height,
+            timestamp: snapTime,
+            frameSwapWallTime: event.endTime || eventTime
+          }) + '\n';
+
+          // Without any DOM snapshot the viewer would show a blank frame, so
+          // fall back to displaying the screenshot itself (main frame only).
+          if (!hasDomSnapshots) {
+            const bytes = await readResource(session, att.resource);
+            if (bytes) {
+              const b64 = bytesToBase64(bytes);
+              const fallbackDom = {
+                doctype: 'html',
+                frameId: mainFrameId,
+                isMainFrame: true,
+                html: ['HTML', {},
+                  ['HEAD', {}],
+                  ['BODY', { style: 'margin:0;overflow:hidden;background:#0f0f0f;display:flex;align-items:center;justify-content:center;height:100vh;' },
+                    ['IMG', { src: `data:${att.contentType || 'image/jpeg'};base64,${b64}`, style: 'max-width:100%;max-height:100%;object-fit:contain;' }]
+                  ]
+                ],
+                url: recording.url || '',
+                viewport
+              };
+              for (const name of [`before@${actionId}`, `action@${actionId}`, `after@${actionId}`]) {
+                // The synthetic DOM is built here rather than read from IDB: no
+                // DOM snapshot exists at all for this action.
+                const html = referencerFor(mainFrameId)(
+                  neutralizeScripts(fallbackDom.html, name));
+                yield JSON.stringify({
+                  type: 'frame-snapshot',
+                  snapshot: {
+                    callId: actionId,
+                    snapshotName: name,
+                    pageId,
+                    frameId: mainFrameId,
+                    frameUrl: recording.url || '',
+                    doctype: 'html',
+                    html,
+                    viewport,
+                    timestamp: snapTime,
+                    wallTime: snapTime,
+                    collectionTime: 0,
+                    resourceOverrides,
+                    isMainFrame: true
+                  }
+                }) + '\n';
+              }
+              afterEvent.afterSnapshot = `after@${actionId}`;
+            }
+          }
+
+          attachments.push({
+            name: att.name || 'screenshot',
+            contentType: att.contentType || 'image/jpeg',
+            sha1: att.resource
+          });
+        }
+
+        if (attachments.length > 0) afterEvent.attachments = attachments;
+        yield JSON.stringify(afterEvent) + '\n';
+
+      } else if (event.type === 'console') {
+        yield JSON.stringify({
+          type: 'event',
+          time: relTime(eventTime),
+          class: 'Page',
+          method: 'console',
+          params: {
+            type: event.messageType || 'log',
+            text: event.text || '',
+            location: event.location || { url: '', lineNumber: 0, columnNumber: 0 }
+          },
+          pageId,
+          internal: {}
+        }) + '\n';
+      }
     }
   }
 
-  zip.file('trace.trace', traceTraceLines.join('\n') + '\n');
-  zip.file('trace.network', traceNetworkLines.join('\n') + '\n');
+  try {
+    await zip.addStream('trace.trace', chunkLines(traceLines()));
+  } catch (err) {
+    throw new Error(`stream trace.trace: ${err && err.message}`);
+  }
 
-  const zipData = await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE' });
+  // ── trace.network ───────────────────────────────────────────────────────────
+  async function* networkLines() {
+    for await (const req of readRequests(session)) {
+      if (!req.url || !req.url.startsWith('http')) continue;
+
+      const postData = req.postDataSha1
+        ? { _sha1: req.postDataSha1 }
+        : (req.postDataText != null ? { text: req.postDataText } : undefined);
+
+      yield JSON.stringify({
+        type: 'resource-snapshot',
+        snapshot: {
+          pageref: pageId,
+          // Viewer matches same-frame responses first when resolving a URL.
+          _frameref: req.frameId || mainFrameId,
+          // Viewer picks the most recent response whose time is <= the snapshot
+          // timestamp; without this the last response wins for every snapshot.
+          _monotonicTime: relTime(req.timestamp || baseTime),
+          startedDateTime: new Date(req.timestamp || baseTime).toISOString(),
+          time: relTime(req.timestamp || baseTime),
+          request: {
+            url: req.url,
+            method: req.method || 'GET',
+            headers: req.requestHeaders || [],
+            postData
+          },
+          response: {
+            status: req.status || 0,
+            statusText: req.statusText || '',
+            headers: req.responseHeaders || [],
+            content: {
+              mimeType: req.mimeType || '',
+              size: req.bodySize || 0,
+              _sha1: req.bodyResource || undefined
+            }
+          }
+        },
+        pageId
+      }) + '\n';
+    }
+  }
+
+  try {
+    await zip.addStream('trace.network', chunkLines(networkLines()));
+  } catch (err) {
+    throw new Error(`stream trace.network: ${err && err.message}`);
+  }
+
+  // ── resources ───────────────────────────────────────────────────────────────
+  // Read back from IndexedDB one at a time; each value is an inline byte buffer,
+  // so no Blob-handle I/O (which fails across service-worker restarts) happens.
+  // A single resource is resident only until its zip entry is compressed.
+  const resourceNames = await listResourceNames(session);
+
+  let stored = 0;
+  let missing = 0;
+  for (const name of resourceNames) {
+    let bytes;
+    try {
+      bytes = await readResource(session, name);
+    } catch (err) {
+      console.warn('[TraceGen] Could not read resource', name, err);
+    }
+    if (!bytes) { missing++; continue; }
+    try {
+      await zip.addStream(RESOURCE_PREFIX + name, [bytes]);
+    } catch (err) {
+      throw new Error(`stream resource ${name}: ${err && err.message}`);
+    }
+    stored++;
+  }
+  if (missing) console.warn(`[TraceGen] ${missing} resource(s) were unavailable`);
+  console.log(`[TraceGen] Wrote ${stored} resource(s) into the archive`);
+
+  const blob = zip.finish();
 
   return {
     id,
-    zipData,
-    name: tracePayload.name,
-    url: tracePayload.url,
+    blob,
+    name: recording.name,
+    url: recording.url,
     timestamp: nowWall,
-    eventCount: tracePayload.events.length,
-    size: zipData.length
+    eventCount,
+    size: blob.size
   };
 }
 
-export { generatePlaywrightTraceInBrowser };
+export { generatePlaywrightTraceInBrowser, createSubtreeReferencer };

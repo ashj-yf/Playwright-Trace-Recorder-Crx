@@ -2,6 +2,8 @@
 
 'use strict';
 
+import { getTrace } from './traceStore.js';
+
 const recordBtn          = document.getElementById('recordBtn');
 const statusBadge        = document.getElementById('statusBadge');
 const recordingNameInput = document.getElementById('recordingName');
@@ -44,6 +46,9 @@ function onPortMessage(message) {
     case 'EVENT_CAPTURED':
       addLog(`Captured: ${message.eventType} on ${message.selector || '(unknown)'}`);
       break;
+    case 'RECORDING_LIMIT':
+      addLog(message.message || 'Capture budget reached.');
+      break;
     case 'TRACES_UPDATED':
       renderTraces(message.traces || []);
       break;
@@ -68,6 +73,10 @@ function applyStatus(recording, currentRecording) {
   }
 }
 
+// A long recording emits an entry per captured event; without a ceiling the log
+// itself becomes a memory leak in the panel document.
+const MAX_LOG_ENTRIES = 200;
+
 function addLog(message) {
   const entry = document.createElement('div');
   entry.className = 'log-entry';
@@ -76,8 +85,12 @@ function addLog(message) {
   outputDiv.appendChild(entry);
   outputDiv.scrollTop = outputDiv.scrollHeight;
 
-  // Show toggle button if there are log entries (more than the initial "Ready" message)
   const logEntries = outputDiv.querySelectorAll('.log-entry');
+  for (let i = 0; i < logEntries.length - MAX_LOG_ENTRIES; i++) {
+    logEntries[i].remove();
+  }
+
+  // Show toggle button if there are log entries (more than the initial "Ready" message)
   if (logEntries.length > 1) {
     outputToggle.style.display = 'block';
   }
@@ -293,16 +306,14 @@ function renderTraces(traces) {
 async function downloadTrace(trace) {
   addLog(`Downloading trace "${trace.name}"…`);
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_TRACE_ZIP', id: trace.id });
-    if (!response || !response.zipBase64) {
-      addLog(`Download failed: trace data not found`);
+    const blob = await resolveTraceBlob(trace.id);
+    if (!blob) {
+      addLog('Download failed: trace data not found');
       return;
     }
-    const binary = atob(response.zipBase64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
 
-    const blob = new Blob([bytes], { type: 'application/zip' });
+    // The Blob is backed by the browser's blob store, so the archive is never
+    // held in this page's heap.
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -310,11 +321,36 @@ async function downloadTrace(trace) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    // Revoking immediately can cancel the download before it starts.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
     addLog(`Downloaded: ${trace.name}.zip`);
   } catch (err) {
     addLog(`Download error: ${err.message}`);
   }
+}
+
+/**
+ * Read the archive directly out of IndexedDB. Older traces predate that and are
+ * still base64 in chrome.storage.local, so fall back to asking the worker.
+ */
+async function resolveTraceBlob(id) {
+  try {
+    const record = await getTrace(id);
+    // Archives are stored as inline bytes (durable across service-worker
+    // restarts); wrap them into a Blob for the download object URL.
+    if (record && record.data) {
+      return new Blob([record.data], { type: 'application/zip' });
+    }
+  } catch (err) {
+    console.warn('Could not read trace from IndexedDB:', err);
+  }
+
+  const response = await chrome.runtime.sendMessage({ type: 'GET_LEGACY_TRACE_ZIP', id });
+  if (!response || !response.zipBase64) return null;
+  const binary = atob(response.zipBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: 'application/zip' });
 }
 
 async function deleteTrace(id, li) {
