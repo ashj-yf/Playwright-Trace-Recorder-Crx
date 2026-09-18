@@ -5,6 +5,7 @@ import * as http from 'http';
  *  - a large DOM, a big stylesheet re-read on every snapshot, multi-megabyte
  *    media, an external script bundle,
  *  - a same-origin iframe (multi-frame snapshots),
+ *  - eight burst buttons (a click burst that outpaces CDP capture),
  *  - an open shadow root (Shadow DOM serialization),
  *  - live form state (checkbox/select/text value markers),
  *  - a constructable/adopted stylesheet,
@@ -54,6 +55,8 @@ export function buildPage(): string {
       `<td>${'lorem ipsum dolor sit amet '.repeat(4)}</td></tr>`
     );
   }
+  const burstButtons = Array.from({ length: 8 },
+    (_, i) => `<button class="burst" id="burst-${i}">Burst ${i}</button>`);
   return `<!DOCTYPE html>
 <html><head>
 <title>Memory Test Page</title>
@@ -67,6 +70,7 @@ export function buildPage(): string {
 <button id="btn1">Action One</button>
 <button id="btn2">Action Two</button>
 <button id="btn3">Action Three</button>
+${burstButtons.join('\n')}
 <input id="field" type="text">
 <input id="check1" type="checkbox" checked>
 <select id="sel"><option value="a">A</option><option value="b" selected>B</option></select>

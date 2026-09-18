@@ -390,11 +390,15 @@ async function generatePlaywrightTraceInBrowser(recording) {
           actionName, event.actionSnapshotIds, actionId, relTime(eventTime));
         for (const line of actionLines) yield line;
 
-        yield JSON.stringify({
-          type: 'input',
-          callId: actionId,
-          inputSnapshot: actionName
-        }) + '\n';
+        // A gated action snapshot must not leave a dangling inputSnapshot
+        // reference behind: emit the input line only when the action stage
+        // exists. point rides along so the viewer can pin the click position.
+        if (actionLines.length > 0) {
+          yield JSON.stringify({
+            type: 'input', callId: actionId, inputSnapshot: actionName,
+            ...(event.params && event.params.point ? { point: event.params.point } : {})
+          }) + '\n';
+        }
 
         pendingActions.set(actionId, {
           hasDom: beforeLines.length > 0 || actionLines.length > 0

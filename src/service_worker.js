@@ -210,7 +210,7 @@ function createRecording(name, tabId) {
     bytes: { network: 0, css: 0, snapshots: 0, screenshots: 0 },
     dropped: {
       network: 0, oversize: 0, css: 0, snapshots: 0, screenshots: 0,
-      events: 0, requests: 0, postData: 0
+      events: 0, requests: 0, postData: 0, actionSnapshots: 0
     },
     pendingWrites: new Set(),
     // All request-record mutations serialize through this chain so get/merge/put
@@ -1240,7 +1240,9 @@ async function logEvent(rec, data) {
 /**
  * Queue an interaction for recording. Captures run one at a time; when actions
  * arrive faster than snapshots can be taken, the excess is still recorded but
- * without snapshots rather than piling up concurrent CDP work.
+ * without its action-stage snapshot (the before stage references the previous
+ * snapshot, the after stage is always captured) rather than piling up
+ * concurrent CDP work.
  *
  * Consecutive fill events on the same element describe one typing burst and
  * are merged into a single Page.fill action (like Playwright codegen): their
@@ -1299,11 +1301,13 @@ function enqueueAction(event) {
 
   settlePendingFill('interrupt');
 
-  const withSnapshots = captureQueueDepth < LIMITS.maxQueuedCaptures &&
+  // Action-stage snapshot gate: bursts that outpace CDP capture skip only the
+  // mid-action snapshot; their before/after stages still land.
+  const withActionSnapshot = captureQueueDepth < LIMITS.maxQueuedCaptures &&
     rec.eventCount < LIMITS.maxEvents;
   captureQueueDepth++;
   captureChain = captureChain
-    .then(() => recordAction(rec, event, withSnapshots))
+    .then(() => recordAction(rec, event, { withActionSnapshot }))
     .catch(err => console.warn('Failed to record action:', err))
     .then(() => { captureQueueDepth--; });
 }
@@ -1312,15 +1316,16 @@ async function recordFillAction(rec, pending) {
   await pending.settledPromise;
   // The recording may have been stopped while the burst was settling.
   if (rec !== activeRecording) return;
-  // Snapshot eligibility is evaluated now, not when the first keystroke landed:
-  // this job occupied a queue slot while waiting for the burst to settle, so the
-  // enqueue-time depth would deny snapshots to actions queued behind typing.
-  const withSnapshots = captureQueueDepth < LIMITS.maxQueuedCaptures &&
+  // Action-stage snapshot eligibility is evaluated now, not when the first
+  // keystroke landed: this job occupied a queue slot while waiting for the
+  // burst to settle, so the enqueue-time depth would deny the action snapshot
+  // to actions queued behind typing.
+  const withActionSnapshot = captureQueueDepth < LIMITS.maxQueuedCaptures &&
     rec.eventCount < LIMITS.maxEvents;
-  await recordAction(rec, pending.event, withSnapshots);
+  await recordAction(rec, pending.event, { withActionSnapshot });
 }
 
-async function recordAction(rec, event, withSnapshots) {
+async function recordAction(rec, event, opts) {
   // The recording may have been stopped while this action sat in the queue.
   if (rec !== activeRecording) return;
 
@@ -1336,10 +1341,14 @@ async function recordAction(rec, event, withSnapshots) {
     Object.fromEntries(Object.entries(captured).map(([fid, snap]) => [fid, snap.id]));
 
   let actionSnapshotIds = {};
-  if (withSnapshots) {
-    const actionResult = await captureDomSnapshot(rec);
-    actionSnapshotIds = flatSnapshotIds(actionResult);
+  if (opts.withActionSnapshot) {
+    actionSnapshotIds = flatSnapshotIds(await captureDomSnapshot(rec));
     if (rec !== activeRecording) return;
+  } else {
+    // Burst overflow: only the action-stage snapshot is suppressed (counted
+    // like the other budget drops); the after stage below is still captured so
+    // every action keeps a post-state snapshot.
+    rec.dropped.actionSnapshots++;
   }
 
   if (rec.debuggeeTabId && rec.bytes.screenshots < LIMITS.maxScreenshotBytes) {
@@ -1377,7 +1386,12 @@ async function recordAction(rec, event, withSnapshots) {
     params: {
       selector: event.selector || '',
       ...(event.value != null ? { value: event.value } : {}),
-      ...(event.key != null ? { key: event.key } : {})
+      ...(event.key != null ? { key: event.key } : {}),
+      // Optional context the viewer/replayer uses: which element produced a
+      // synthetic event (Task 4) and where a click landed (red-dot point).
+      ...(event.sourceSelector ? { sourceSelector: event.sourceSelector } : {}),
+      ...(Number.isFinite(event.x) && Number.isFinite(event.y)
+        ? { point: { x: Math.round(event.x), y: Math.round(event.y) } } : {})
     },
     pageId: 'page1',
     timestamp,
@@ -1385,16 +1399,19 @@ async function recordAction(rec, event, withSnapshots) {
     actionSnapshotIds
   });
 
+  // The after snapshot is unconditional (debugger attached is the only
+  // condition): a burst must never leave an action without its post-state.
   let afterSnapshotIds = {};
-  if (withSnapshots && rec.debuggeeTabId) {
+  if (rec.debuggeeTabId) {
     await new Promise(resolve => setTimeout(resolve, 150));
     if (rec !== activeRecording) return;
     const afterResult = await captureDomSnapshot(rec);
     afterSnapshotIds = flatSnapshotIds(afterResult);
     for (const [fid, snap] of Object.entries(afterResult)) {
       rec.lastSnapshotIds[fid] = snap.id;
+      // rec.url is owned by the initial snapshot backfill and (from Task 3)
+      // the CDP navigation handler; only viewport is backfilled here.
       if (fid === rec.mainFrameId) {
-        if (!rec.url && snap.url) rec.url = snap.url;
         if (!rec.viewport && snap.viewport) rec.viewport = snap.viewport;
       }
     }
@@ -1409,11 +1426,6 @@ async function recordAction(rec, event, withSnapshots) {
     attachments,
     afterSnapshotIds
   });
-
-  if (!rec.url && event.url) {
-    rec.url = event.url;
-    persistSession(rec);
-  }
 }
 
 // ── Network capture ───────────────────────────────────────────────────────────
