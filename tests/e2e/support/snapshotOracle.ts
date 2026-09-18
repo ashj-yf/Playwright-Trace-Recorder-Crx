@@ -33,3 +33,28 @@ export function renderSnapshots(frameSnapshotLines: any[]): RenderedSnapshot[] {
     html: String(renderer.render().html)
   }));
 }
+
+/**
+ * Resolves snapshot resources exactly the way the trace viewer's service worker
+ * does when it serves `/trace/resources/...`: the same SnapshotStorage that the
+ * viewer builds from `trace.network` (`resource-snapshot` lines) and
+ * `trace.trace` (`frame-snapshot` lines) — exact absolute-URL string matching,
+ * monotonic-time cutoff, same-frame preference and resourceOverrides applied.
+ *
+ * All frame-snapshot lines must be passed together and in emission order, and
+ * `finalize()` must run before `resourceByUrl` (it sorts resources by time and
+ * collects override URLs, as the viewer does after loading a trace).
+ */
+export function buildResourceOracle(frameSnapshotLines: any[], networkLines: any[]) {
+  const storage = new SnapshotStorage();
+  for (const line of networkLines) storage.addResource('context@test', line.snapshot);
+  const renderers = frameSnapshotLines.map(
+    line => storage.addFrameSnapshot('context@test', line.snapshot, [])
+  );
+  storage.finalize();
+  return {
+    renderers,
+    resourceByUrl: (idx: number, url: string, method = 'GET') =>
+      renderers[idx].resourceByUrl(url, method)
+  };
+}

@@ -8,7 +8,10 @@ import * as http from 'http';
  *  - an open shadow root (Shadow DOM serialization),
  *  - live form state (checkbox/select/text value markers),
  *  - a constructable/adopted stylesheet,
- *  - an inline <script> whose source must be retained without executing.
+ *  - an inline <script> whose source must be retained without executing,
+ *  - resource-bearing elements whose URLs must be absolutized: link/img/video
+ *    poster/srcset, SVG use + image, embed/object, a javascript: anchor and an
+ *    inline style url().
  */
 
 export const PORT = 8153;
@@ -72,7 +75,15 @@ export function buildPage(): string {
 <div class="adopted-sentinel">${ADOPTED_SENTINEL}</div>
 <img src="/small.png" width="20" height="20">
 <img src="/huge.png" width="20" height="20">
-<video src="/huge.mp4" preload="auto" muted></video>
+<video src="/huge.mp4" poster="/small.png" preload="auto" muted></video>
+<a id="rel-link" href="/frame.html">relative link</a>
+<img id="srcset-img" srcset="/small.png 1x, /small.png 2x" width="10" height="10">
+<svg width="20" height="20"><use href="#sym"/></svg>
+<svg><image href="/small.png" width="10" height="10"/></svg>
+<embed src="/small.png" type="image/png">
+<object data="/small.png" type="image/png"></object>
+<a href="javascript:alert(1)" id="js-link">javascript link</a>
+<div id="inline-bg" style="background:url(/small.png)"></div>
 <div class="inline-tail-sentinel">styled only by the tail of the inline sheet</div>
 <div class="cssom-only-sentinel">styled only from the CSSOM</div>
 <table>${rows.join('')}</table>

@@ -926,6 +926,42 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
         a['__playwright_selected_'] = n.selected ? 'true' : 'false';
       }
     }
+    // Resource URLs must be absolute: the trace viewer serves resources by
+    // exact absolute-URL string match, so a snapshot keeping "/img.png" can
+    // never hit its resource table. Aligns with official snapshotterInjected.
+    var KEEP_URL = /^(https?:|data:|blob:|about:|mailto:|tel:|sftp:|ftp:|ws:|wss:)/i;
+    var JS_URL = /^\\s*(?:javascript|vbscript):/i;
+    function sanitizeUrl(u){ if(u==null) return u; u=String(u); return JS_URL.test(u)?'':u; }
+    function absolutize(u, base){
+      if(u==null) return u; u=String(u).trim(); if(!u) return u;
+      if(u.charAt(0)==='#') return u;
+      if(KEEP_URL.test(u)) return sanitizeUrl(u);
+      try{ return new URL(u, base).href; }catch(e){ return sanitizeUrl(u); }
+    }
+    function absolutizeSrcSet(v, base){
+      if(!v) return v;
+      return v.split(',').map(function(part){
+        var t=part.trim(); if(!t) return '';
+        var sp=t.lastIndexOf(' ');
+        return sp===-1 ? absolutize(t,base) : absolutize(t.slice(0,sp),base)+t.slice(sp);
+      }).join(', ');
+    }
+    function absolutizeCssUrls(text, base){   // inline style text and style attributes
+      return String(text).replace(/url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/g, function(m,q,u){
+        return 'url(' + absolutize(u, base) + ')';
+      });
+    }
+    // Only string-typed IDL is accepted: HTML URL properties are already
+    // absolute, while SVG's SVGAnimatedString (an object) falls back to
+    // absolutize(). Keyed by attribute name so e.g. a video's poster never
+    // picks up the element's (absolute) src value.
+    function idlUrl(n, an){
+      try{
+        var v = (an === 'href' || an === 'src' || an === 'data') ? n[an] : null;
+        if(typeof v === 'string' && v) return v;
+      }catch(e){}
+      return null;
+    }
     function s(n,d){
       if(!n || d > 80) return null;
       if(nodes >= MAX_NODES){ truncated = true; return null; }
@@ -939,18 +975,33 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
       if(n.tagName === 'NOSCRIPT') return null;
       nodes++;
       var a = {}, i, ch = [], tn = n.tagName;
-      for(i = 0; i < n.attributes.length; i++){ a[n.attributes[i].name] = n.attributes[i].value; }
+      var URL_ATTRS = { href:1, src:1, srcset:1, poster:1, data:1, 'xlink:href':1 };
+      for(i = 0; i < n.attributes.length; i++){
+        var an = n.attributes[i].name, av = n.attributes[i].value;
+        if (an === 'style' && av && av.indexOf('url(') >= 0) { a[an] = absolutizeCssUrls(av, n.baseURI || document.baseURI); continue; }
+        if (tn === 'IFRAME' || tn === 'FRAME') { a[an] = av; continue; }  // src is replaced by the #frameId/name route at export
+        if (URL_ATTRS[an] !== 1) { a[an] = av; continue; }
+        if (an === 'srcset') a[an] = absolutizeSrcSet(av, n.baseURI || document.baseURI);
+        else if (an === 'xlink:href') a[an] = sanitizeUrl(absolutize(av, n.baseURI || document.baseURI));
+        else { var idl = idlUrl(n, an); a[an] = sanitizeUrl(idl != null ? idl : absolutize(av, n.baseURI || document.baseURI)); }
+      }
       // Script sources are retained (neutralized at export so they cannot run).
       if(tn === 'SCRIPT'){
         nodes++;
         return ['SCRIPT', a, n.textContent || ''];
       }
       if(tn === 'STYLE'){
-        var css = styleText(n);
+        var css = absolutizeCssUrls(styleText(n), document.baseURI);
         nodes++;
         return css ? ['STYLE', a, css] : ['STYLE', a];
       }
       applyLiveState(n, a);
+      // The URL the browser actually picked (srcset resolution included) — the
+      // viewer promotes this marker to src and demotes the authored ones.
+      if(tn === 'IMG' || tn === 'PICTURE'){
+        var cs=''; try{ cs = n.currentSrc || ''; }catch(e){}
+        a['__playwright_current_src__'] = sanitizeUrl(cs);
+      }
       if(tn === 'IFRAME' || tn === 'FRAME'){
         var mapped = FRAME_MAP[frameIdx];
         if(mapped) a['__pw_frame__'] = mapped;
