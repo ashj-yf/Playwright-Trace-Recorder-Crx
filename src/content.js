@@ -1,9 +1,8 @@
 // Content script for User Interaction Recorder
-// Guard: only run in the top-level frame, never inside iframes.
-if (window !== window.top) {
-  // Silently exit - do nothing in sub-frames.
-  // (belt-and-suspenders; manifest also sets all_frames: false)
-} else if (window._ventriloquistInjected) {
+// Runs in every frame: DOM events never cross frame boundaries, so each
+// frame's document needs its own listeners for iframe interactions to be
+// recorded.
+if (window._ventriloquistInjected) {
   // Already injected in this frame (e.g. due to a programmatic re-injection race).
   // Send current recording status instead of re-initialising.
   chrome.runtime.sendMessage({ type: 'GET_RECORDING_STATUS' });
@@ -529,4 +528,4 @@ function highlightElement(element) {
   }, 500);
 }
 
-} // end top-frame guard
+} // end injection guard

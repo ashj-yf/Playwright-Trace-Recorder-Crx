@@ -318,11 +318,11 @@ async function startRecording(name, tabId) {
       // Content script unresponsive — stale context after extension reload.
       try {
         await chrome.scripting.executeScript({
-          target: { tabId },
+          target: { tabId, allFrames: true },
           func: () => { window._ventriloquistInjected = false; }
         });
         await chrome.scripting.executeScript({
-          target: { tabId },
+          target: { tabId, allFrames: true },
           files: ['src/content.js']
         });
       } catch (e) {
