@@ -48,7 +48,18 @@ test('records dblclick, contextmenu and dragTo, merges checkbox triple events', 
     await page.mouse.up();
     await page.waitForTimeout(1500);
 
-    await page.click('#check2');
+    // Dragging across text to SELECT it: a selection, not a drag - must not
+    // surface as an additional dragTo.
+    const cell = page.locator('table tr').first().locator('td').nth(0);
+    const cellBox = await cell.boundingBox();
+    expect(cellBox).toBeTruthy();
+    await page.mouse.move(cellBox!.x + 6, cellBox!.y + cellBox!.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(cellBox!.x + cellBox!.width + 30, cellBox!.y + cellBox!.height / 2, { steps: 3 });
+    await page.mouse.up();
+    await page.waitForTimeout(1500);
+    
+await page.click('#check2');
     await page.waitForTimeout(1500);
 
     const outDir = path.join(__dirname, '..', 'test-results', 'interactions');
@@ -65,6 +76,7 @@ test('records dblclick, contextmenu and dragTo, merges checkbox triple events', 
     expect(methods).toContain('dblclick');
     expect(methods).toContain('contextmenu');
     expect(methods).toContain('dragTo');
+    expect(befores.filter(b => b.method === 'dragTo')).toHaveLength(1);   // selection drag adds none
 
     const dbl = befores.find(b => b.method === 'dblclick');
     // The double click's second strike is swallowed; only the first survives.

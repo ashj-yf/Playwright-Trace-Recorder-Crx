@@ -1017,7 +1017,7 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
         var sch = [], k;
         if(sr.adoptedStyleSheets){
           for(k = 0; k < sr.adoptedStyleSheets.length; k++){
-            var stx = sheetText(sr.adoptedStyleSheets[k]);
+            var stx = absolutizeCssUrls(sheetText(sr.adoptedStyleSheets[k]), document.baseURI);
             if(stx) sch.push(['STYLE', {}, stx]);
           }
         }
@@ -1049,7 +1049,7 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
       var bodyNode = findTag(tree, 'BODY');
       if(bodyNode){
         for(var q = 0; q < document.adoptedStyleSheets.length; q++){
-          var atx = sheetText(document.adoptedStyleSheets[q]);
+          var atx = absolutizeCssUrls(sheetText(document.adoptedStyleSheets[q]), document.baseURI);
           if(atx) bodyNode.push(['TEMPLATE', { '__playwright_style_sheet_': atx }]);
         }
       }

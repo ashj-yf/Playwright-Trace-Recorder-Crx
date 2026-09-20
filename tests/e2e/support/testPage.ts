@@ -81,7 +81,7 @@ ${burstButtons.join('\n')}
 <select id="sel"><option value="a">A</option><option value="b" selected>B</option></select>
 <button id="dbl-target">Double Click Target</button>
 <div id="ctx-target">Context Menu Target</div>
-<div id="drag-source" style="width:100px;height:100px;position:absolute;left:120px;top:520px;background:#ddeeff">Drag Source</div>
+<div id="drag-source" style="width:100px;height:100px;position:absolute;left:120px;top:520px;background:#ddeeff;user-select:none">Drag Source</div>
 <div id="drop-zone" style="width:100px;height:100px;position:absolute;left:560px;top:520px;background:#ffeedd">Drop Zone</div>
 <iframe id="childFrame" src="/frame.html"></iframe>
 <div id="shadow-host"></div>
@@ -117,7 +117,7 @@ ${burstButtons.join('\n')}
       '<span class="sh">${SHADOW_SENTINEL}</span>';
   // Constructable stylesheet adopted by the whole document.
   var adopted = new CSSStyleSheet();
-  adopted.replaceSync('.adopted-sentinel { color: rgb(6, 5, 4); }');
+  adopted.replaceSync('.adopted-sentinel { color: rgb(6, 5, 4); background: url(/small.png); }');
   document.adoptedStyleSheets = [adopted];
   // Pull the big media file through the ordinary network stack: media elements
   // load via a separate pipeline whose body CDP cannot always return, while a

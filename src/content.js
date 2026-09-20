@@ -162,6 +162,11 @@ function handleContextmenu(event) {
 // Handle mousedown events: anchor a potential drag gesture.
 function handleMouseDown(event) {
   if (!isRecording || isReplaying) return;
+  // Only the primary button anchors a drag. Non-primary drags (middle-click
+  // autoscroll pan, canvas panning) fire no click in Chrome, so a fabricated
+  // dragTo would arm a suppressClickUntil window that never gets consumed
+  // and could swallow the next genuine left click.
+  if (event.button !== 0) { dragGesture = null; return; }
 
   dragGesture = {
     selector: getElementSelector(event.target),
@@ -181,6 +186,10 @@ function handleMouseUp(event) {
   if (!g) return;
   const dx = event.clientX - g.x, dy = event.clientY - g.y;
   if (dx * dx + dy * dy < DRAG_MIN_DISTANCE * DRAG_MIN_DISTANCE) return; // ordinary click
+  // A non-collapsed selection means the pointer was selecting text, not
+  // dragging: drop the gesture and leave the click window unarmed.
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed) return;   // text selection, not a drag
   suppressClickUntil = Date.now() + 100;
   sendEventToBackground({
     type: 'dragTo',

@@ -61,6 +61,7 @@ test('absolutizes resource URLs so the viewer can serve them', async ({ page, co
     expect(rawMain[0]).toContain('"data":"http://localhost:8153/small.png"');
     expect(rawMain[0]).toContain('"__playwright_current_src__":"http://localhost:8153/small.png"');
     expect(rawMain[0]).toContain('url(http://localhost:8153/small.png)');   // inline style url()
+    expect(rawMain[0]).toContain('__playwright_style_sheet_":".adopted-sentinel { color: rgb(6, 5, 4); background: url(http://localhost:8153/small.png)');   // adopted sheet url()
     expect(rawMain[0]).toContain('"srcset":"http://localhost:8153/small.png 1x');
     expect(rawMain[0]).toContain('"href":"#sym"');                          // fragment kept
     expect(rawMain[0]).toContain('"href":""');                              // javascript: cleared
