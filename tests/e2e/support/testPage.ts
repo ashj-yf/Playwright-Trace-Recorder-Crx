@@ -6,6 +6,7 @@ import * as http from 'http';
  *    media, an external script bundle,
  *  - a same-origin iframe (multi-frame snapshots),
  *  - eight burst buttons (a click burst that outpaces CDP capture),
+ *  - SPA routing controls (pushState button + hash anchor),
  *  - an open shadow root (Shadow DOM serialization),
  *  - live form state (checkbox/select/text value markers),
  *  - a constructable/adopted stylesheet,
@@ -71,6 +72,8 @@ export function buildPage(): string {
 <button id="btn2">Action Two</button>
 <button id="btn3">Action Three</button>
 ${burstButtons.join('\n')}
+<button id="spa-push" onclick="history.pushState(null,'','/spa-route')">SPA Push</button>
+<a id="hash-link" href="#/hash-route">hash link</a>
 <input id="field" type="text">
 <input id="check1" type="checkbox" checked>
 <select id="sel"><option value="a">A</option><option value="b" selected>B</option></select>
@@ -149,6 +152,7 @@ export function startServer(): Promise<http.Server> {
     switch (url) {
       case '/':
       case '/index.html': return send('text/html; charset=utf-8', buildPage());
+      case '/spa-route': return send('text/html; charset=utf-8', buildPage());
       case '/frame.html': return send('text/html; charset=utf-8', buildFramePage());
       case '/big.css': return send('text/css', css);
       case '/app.js': return send('application/javascript',

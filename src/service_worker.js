@@ -1705,6 +1705,29 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
 
+  // Navigation events are the only Frame.navigated source for the timeline and,
+  // after the initial snapshot backfill, the sole runtime owner of rec.url.
+  // frameNavigated covers full-page loads (a new main frame id arrives here
+  // before any getFrameTree call has seen it — hence the resync), and
+  // navigatedWithinDocument covers SPA route changes (pushState/replaceState).
+  // Every frame session reports here, but worker targets never enable the Page
+  // domain, so no worker noise reaches this branch.
+  if (method === 'Page.frameNavigated' || method === 'Page.navigatedWithinDocument') {
+    const cdpFrameId = params.frame ? params.frame.id : params.frameId;
+    if (cdpFrameId) enqueueRequestTask(rec, async () => {
+      if (!rec.frames.has(cdpFrameId)) await syncFrameTree(rec);
+      const frameId = frameIdForNetwork(rec, sessionId, { frameId: cdpFrameId });
+      const url = (params.frame && params.frame.url) || params.url || '';
+      const name = (params.frame && params.frame.name) || '';
+      if (!url) return;
+      const entry = rec.frames.get(cdpFrameId);
+      if (entry) entry.url = url;
+      if (frameId === rec.mainFrameId && url !== rec.url) { rec.url = url; persistSession(rec); }
+      await logEvent(rec, { type: 'navigation', frameId, url, name: name || '', timestamp: Date.now() });
+    });
+    return;
+  }
+
   // Only the handful of Network events the trace format actually consumes are
   // retained; every frame/worker session reports into the same stores.
   if (method === 'Network.requestWillBeSent') {

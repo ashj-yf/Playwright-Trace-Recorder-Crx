@@ -336,17 +336,37 @@ async function generatePlaywrightTraceInBrowser(recording) {
       internal: {}
     }) + '\n';
 
-    if (recording.url) {
+    // The synthetic initial line states where the recording STARTED. With the
+    // CDP navigation handler owning rec.url, recording.url is now the FINAL url
+    // (metadata deliberately keeps it), so the start url comes from the first
+    // main-frame navigation event — which is the Page.reload echo at recording
+    // start — falling back to recording.url when no navigation was captured.
+    let initialUrl = recording.url || '';
+    for await (const ev of readEvents(session)) {
+      if (ev && ev.type === 'navigation' && ev.frameId === mainFrameId && ev.url) {
+        initialUrl = ev.url;
+        break;
+      }
+    }
+
+    if (initialUrl) {
       yield JSON.stringify({
         type: 'event',
         time: relTime(baseTime),
         class: 'Frame',
         method: 'navigated',
-        params: { url: recording.url, name: '' },
+        params: { url: initialUrl, name: '' },
         pageId,
         internal: {}
       }) + '\n';
     }
+
+    // Consecutive same-URL navigations of one frame carry no timeline
+    // information (the Page.reload echo repeats the start url the synthetic
+    // line already announced); seeding the main frame's last url absorbs it
+    // instead of emitting a duplicate.
+    const lastNavigatedUrl = new Map();
+    lastNavigatedUrl.set(mainFrameId, initialUrl);
 
     let actionIndex = 0;
     const pendingActions = new Map();
@@ -509,6 +529,25 @@ async function generatePlaywrightTraceInBrowser(recording) {
             text: event.text || '',
             location: event.location || { url: '', lineNumber: 0, columnNumber: 0 }
           },
+          pageId,
+          internal: {}
+        }) + '\n';
+      } else if (event.type === 'navigation') {
+        // Only the main frame's navigations enter the timeline: the line
+        // format carries no frame identity (official Frame.navigated params
+        // are just {url, name}), so a child frame's navigation would read as
+        // the page itself navigating. Child-frame events stay recorded in the
+        // event store. `name` is the CDP frame name (iframe name attribute),
+        // not the document title — official frameDispatcher semantics.
+        if (event.frameId !== mainFrameId) continue;
+        if (lastNavigatedUrl.get(event.frameId) === event.url) continue;
+        lastNavigatedUrl.set(event.frameId, event.url);
+        yield JSON.stringify({
+          type: 'event',
+          time: relTime(eventTime),
+          class: 'Frame',
+          method: 'navigated',
+          params: { url: event.url, name: event.name || '' },
           pageId,
           internal: {}
         }) + '\n';
