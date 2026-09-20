@@ -7,6 +7,7 @@ import * as http from 'http';
  *  - a same-origin iframe (multi-frame snapshots),
  *  - eight burst buttons (a click burst that outpaces CDP capture),
  *  - SPA routing controls (pushState button + hash anchor),
+ *  - mouse gesture targets (double click, context menu, drag&drop),
  *  - an open shadow root (Shadow DOM serialization),
  *  - live form state (checkbox/select/text value markers),
  *  - a constructable/adopted stylesheet,
@@ -76,7 +77,12 @@ ${burstButtons.join('\n')}
 <a id="hash-link" href="#/hash-route">hash link</a>
 <input id="field" type="text">
 <input id="check1" type="checkbox" checked>
+<input id="check2" type="checkbox">
 <select id="sel"><option value="a">A</option><option value="b" selected>B</option></select>
+<button id="dbl-target">Double Click Target</button>
+<div id="ctx-target">Context Menu Target</div>
+<div id="drag-source" style="width:100px;height:100px;position:absolute;left:120px;top:520px;background:#ddeeff">Drag Source</div>
+<div id="drop-zone" style="width:100px;height:100px;position:absolute;left:560px;top:520px;background:#ffeedd">Drop Zone</div>
 <iframe id="childFrame" src="/frame.html"></iframe>
 <div id="shadow-host"></div>
 <div class="adopted-sentinel">${ADOPTED_SENTINEL}</div>

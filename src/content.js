@@ -13,6 +13,15 @@ if (window !== window.top) {
 let isRecording = false;
 let isReplaying = false;
 
+// Drag gesture tracking: mousedown anchors a potential drag, mouseup decides
+// whether the pointer travelled past DRAG_MIN_DISTANCE pixels (one dragTo
+// action) or whether it was an ordinary click. The click browsers fire after
+// a drag (on the common ancestor of the mousedown/mouseup targets) is
+// swallowed through suppressClickUntil.
+let dragGesture = null;
+let suppressClickUntil = 0;
+const DRAG_MIN_DISTANCE = 6;
+
 // Initialize content script
 console.log('Ventriloquist content script loaded');
 
@@ -67,6 +76,10 @@ function startRecording() {
   
   // Add event listeners for various user interactions
   document.addEventListener('click', handleClick, true);
+  document.addEventListener('dblclick', handleDblclick, true);
+  document.addEventListener('contextmenu', handleContextmenu, true);
+  document.addEventListener('mousedown', handleMouseDown, true);
+  document.addEventListener('mouseup', handleMouseUp, true);
   document.addEventListener('keydown', handleKeydown, true);
   document.addEventListener('scroll', handleScroll, true);
   document.addEventListener('input', handleInput, true);
@@ -84,6 +97,10 @@ function stopRecording() {
   
   // Remove event listeners
   document.removeEventListener('click', handleClick, true);
+  document.removeEventListener('dblclick', handleDblclick, true);
+  document.removeEventListener('contextmenu', handleContextmenu, true);
+  document.removeEventListener('mousedown', handleMouseDown, true);
+  document.removeEventListener('mouseup', handleMouseUp, true);
   document.removeEventListener('keydown', handleKeydown, true);
   document.removeEventListener('scroll', handleScroll, true);
   document.removeEventListener('input', handleInput, true);
@@ -96,6 +113,13 @@ function stopRecording() {
 function handleClick(event) {
   if (!isRecording || isReplaying) return;
   
+  // A double click's second strike is expressed by its dblclick event.
+  if (event.detail >= 2) return;
+  // The click trailing a drag gesture (browsers fire it on the common ancestor
+  // of the mousedown/mouseup targets); the dragTo action already covers it.
+  // No 350ms click delay — event timing stays untouched.
+  if (Date.now() < suppressClickUntil) { suppressClickUntil = 0; return; }
+
   try {
     const selector = getElementSelector(event.target);
     const eventData = {
@@ -111,6 +135,63 @@ function handleClick(event) {
   }
 }
 
+// Handle dblclick events: the whole double click is one action; handleClick
+// has already swallowed the second strike (event.detail >= 2).
+function handleDblclick(event) {
+  if (!isRecording || isReplaying) return;
+
+  sendEventToBackground({
+    type: 'dblclick',
+    selector: getElementSelector(event.target),
+    x: event.clientX,
+    y: event.clientY
+  });
+}
+
+// Handle contextmenu events (right click).
+function handleContextmenu(event) {
+  if (!isRecording || isReplaying) return;
+
+  sendEventToBackground({
+    type: 'contextmenu',
+    selector: getElementSelector(event.target),
+    x: event.clientX,
+    y: event.clientY
+  });
+}
+
+// Handle mousedown events: anchor a potential drag gesture.
+function handleMouseDown(event) {
+  if (!isRecording || isReplaying) return;
+
+  dragGesture = {
+    selector: getElementSelector(event.target),
+    x: event.clientX,
+    y: event.clientY
+  };
+}
+
+// Handle mouseup events: decide drag vs ordinary click. A pointer that
+// travelled at least DRAG_MIN_DISTANCE pixels is one dragTo action carrying
+// the source element and the drop point; the accompanying click is suppressed.
+function handleMouseUp(event) {
+  if (!isRecording || isReplaying) { dragGesture = null; return; }
+
+  const g = dragGesture;
+  dragGesture = null;
+  if (!g) return;
+  const dx = event.clientX - g.x, dy = event.clientY - g.y;
+  if (dx * dx + dy * dy < DRAG_MIN_DISTANCE * DRAG_MIN_DISTANCE) return; // ordinary click
+  suppressClickUntil = Date.now() + 100;
+  sendEventToBackground({
+    type: 'dragTo',
+    sourceSelector: g.selector,
+    selector: getElementSelector(event.target),
+    x: event.clientX,
+    y: event.clientY
+  });
+}
+
 // Elements whose keystrokes describe a text value. Typing into them is merged
 // into a single fill action (the 'input' event carries the whole value), the
 // same way Playwright codegen collapses a burst of keystrokes.
@@ -123,6 +204,16 @@ function isTextEditable(element) {
     return ['text', 'search', 'url', 'tel', 'email', 'password', 'number', ''].includes(type);
   }
   return false;
+}
+
+// A checkbox/radio input. Toggling it produces click + input + change in one
+// burst; only the click action is recorded (checked state rides on the DOM
+// snapshot's __playwright_checked_ marker via applyLiveState). The click's
+// method stays 'click' — Page.check is not a real protocol API.
+function isToggleControl(el) {
+  if (!el || el.tagName !== 'INPUT') return false;
+  const t = (el.getAttribute('type') || '').toLowerCase();
+  return t === 'checkbox' || t === 'radio';
 }
 
 // A key that edits the field's text. The resulting 'input' event covers it.
@@ -197,6 +288,9 @@ function handleScroll(event) {
 function handleInput(event) {
   if (!isRecording || isReplaying) return;
 
+  // Checkbox/radio toggles are covered by their click action + snapshot state.
+  if (isToggleControl(event.target)) return;
+
   try {
     const target = event.target;
     const selector = getElementSelector(target);
@@ -221,6 +315,9 @@ function handleInput(event) {
 // Handle change events
 function handleChange(event) {
   if (!isRecording || isReplaying) return;
+
+  // Checkbox/radio toggles are covered by their click action + snapshot state.
+  if (isToggleControl(event.target)) return;
 
   // Text fields already produced a fill action carrying the final value;
   // their change event only fires at blur and would duplicate it.
