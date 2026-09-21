@@ -125,6 +125,51 @@ test('snapshots carry the markers the viewer needs to restore what was on screen
     // Action duration is measured, not a constant.
     const befores = lines.filter(l => l.type === 'before');
     const afters = lines.filter(l => l.type === 'after');
+
+    // ── Screencast density ───────────────────────────────────────────────────
+    // The filmstrip is drawn from `screencast-frame` lines. Emitting one per
+    // action (a screenshot) instead of streaming them left the strip near-empty
+    // and the recording visibly less smooth than an official one, even though
+    // every individual frame was valid — so frame COUNT alone proves nothing.
+    //
+    // The structural property is that frames arrive on the page's own schedule,
+    // not the recorder's: a per-action capture can only ever be stamped with an
+    // action's start or end instant. Measured on real traces, official
+    // recordings land ~0-14% of frames on a boundary; a per-action recorder
+    // scores a deterministic 100%.
+    const screencastFrames = lines.filter(l => l.type === 'screencast-frame');
+    console.log(`screencast frames: ${screencastFrames.length}`);
+    expect(screencastFrames.length).toBeGreaterThan(0);
+
+    const contextOptions = lines.find(l => l.type === 'context-options')!;
+    const baseWall = contextOptions.wallTime as number;
+    const boundaries = [
+      ...befores.map(b => (b.wallTime as number) ?? baseWall + (b.startTime as number)),
+      ...afters.map(a => (a.wallTime as number) ?? baseWall + (a.endTime as number))
+    ];
+    const onBoundary = screencastFrames.filter(f =>
+      boundaries.some(b => Math.abs((f.frameSwapWallTime as number) - b) <= 5));
+    console.log(`screencast frames on an action boundary: ${onBoundary.length}/${screencastFrames.length}`);
+    expect(onBoundary.length).toBeLessThan(screencastFrames.length);
+
+    // Frame timing must be usable as a timeline: absolute wall clock the viewer
+    // pairs snapshots against, plus a trace-relative offset.
+    for (const f of screencastFrames) {
+      expect(f.frameSwapWallTime).toBeGreaterThan(1e11);
+      expect(typeof f.timestamp).toBe('number');
+      expect(f.timestamp).toBeLessThan(1e11);
+      expect(f.width).toBeGreaterThan(0);
+      expect(f.height).toBeGreaterThan(0);
+    }
+
+    // The stream must actually span the recording rather than bunching at one
+    // end — that is what makes scrubbing feel continuous.
+    const frameTimes = screencastFrames.map(f => f.timestamp).sort((a, b) => a - b);
+    const span = frameTimes[frameTimes.length - 1] - frameTimes[0];
+    console.log(`screencast span: ${span} ms across ${screencastFrames.length} frames`);
+    if (frameTimes.length > 1) expect(span).toBeGreaterThan(200);
+
+    // Action duration is measured, not a constant.
     const durations = befores
       .map(b => {
         const a = afters.find(x => x.callId === b.callId);

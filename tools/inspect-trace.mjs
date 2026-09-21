@@ -245,11 +245,93 @@ if (screencastLines.length && snapshots.length) {
   }
 }
 
-// ── Viewer contract: action duration ──────────────────────────────────────────
-const befores = lines.filter(l => l.type === 'before');
+// ── Viewer contract: screencast density ──────────────────────────────────────
+// The filmstrip and the "what was on screen" track are drawn from
+// `screencast-frame` lines, which the official recorder emits CONTINUOUSLY for
+// the whole session (Page.startScreencast). Emitting one per action instead
+// yields frames only at action boundaries: the strip is nearly empty, scrubbing
+// jumps between a handful of stills, and the recording feels far less smooth
+// than an official one even though every individual frame is valid.
+//
+// Density, not frame count, is the property that was missing — a trace with 3
+// flawless frames still renders as 3 stills.
+
+const beforeActions = lines.filter(l => l.type === 'before');
 const afters = lines.filter(l => l.type === 'after');
+console.log('\nVIEWER CONTRACT (screencast density)');
+if (screencastLines.length) {
+  const ts = screencastLines.map(l => l.timestamp).filter(t => typeof t === 'number');
+  const sorted = [...ts].sort((a, b) => a - b);
+  const span = sorted.length > 1 ? sorted[sorted.length - 1] - sorted[0] : 0;
+  const gaps = [];
+  for (let i = 1; i < sorted.length; i++) gaps.push(sorted[i] - sorted[i - 1]);
+  const median = gaps.length
+    ? [...gaps].sort((a, b) => a - b)[Math.floor(gaps.length / 2)]
+    : 0;
+
+  console.log(`  frames                        ${screencastLines.length}`);
+  console.log(`  covered span                  ${Math.round(span)} ms`);
+  console.log(`  frame interval median / max   ${Math.round(median)} / ${Math.round(Math.max(0, ...gaps))} ms`);
+  if (span > 0) {
+    console.log(`  effective rate                ${(screencastLines.length / (span / 1000)).toFixed(1)} fps`);
+  }
+
+  // The decisive property is not how MANY frames exist — CDP emits a frame only
+  // when the page actually changes, so a static page legitimately produces few,
+  // and an official trace of 10 actions held just 7 frames. What distinguishes a
+  // real screencast is that frames arrive on the PAGE's own schedule: they land
+  // at instants the recorder did not choose.
+  //
+  // A per-action screenshot can only ever be stamped with an action's start or
+  // end instant. So if every frame sits exactly on an action boundary, frames
+  // are being triggered by actions rather than streamed. Measured on real
+  // traces: official ~0-14% of frames land on a boundary; a per-action recorder
+  // scores 100%, deterministically.
+  const contextOptions = lines.find(l => l.type === 'context-options') || {};
+  const baseWall = typeof contextOptions.wallTime === 'number' ? contextOptions.wallTime : 0;
+  const absBoundary = (e, key) =>
+    typeof e.wallTime === 'number' ? e.wallTime : baseWall + (e[key] || 0);
+  // Absolute wall-clock instants of every action boundary.
+  const boundaries = [
+    ...beforeActions.map(b => absBoundary(b, 'startTime')),
+    ...afters.map(a => absBoundary(a, 'endTime'))
+  ];
+  const frameWalls = screencastLines
+    .map(l => l.frameSwapWallTime)
+    .filter(w => typeof w === 'number' && w > 0);
+  const onBoundary = frameWalls.filter(w => boundaries.some(b => Math.abs(w - b) <= 5));
+  const independent = frameWalls.length - onBoundary.length;
+
+  if (frameWalls.length && boundaries.length && independent === 0) {
+    console.log(`  ❌ all ${frameWalls.length} frame(s) sit exactly on an action boundary —`);
+    console.log('     frames are triggered by actions, not streamed, so the viewer has');
+    console.log('     only stills to scrub through however many frames there are');
+    fail(`all ${frameWalls.length} screencast frame(s) coincide with an action boundary: ` +
+      'the screencast is captured per action, not continuously');
+  } else if (frameWalls.length && boundaries.length) {
+    console.log(`  frames off any action boundary ${independent}/${frameWalls.length}`);
+    console.log("  ✅ streamed on the page's own schedule");
+  } else {
+    console.log('  ✅ streamed continuously');
+  }
+
+  // Every frame must be an actual image. A declared frame whose resource is
+  // missing renders as a blank tile in the strip.
+  const missing = screencastLines.filter(l => !entries.includes(`resources/${l.sha1}`));
+  if (missing.length) {
+    console.log(`  ❌ ${missing.length} frame(s) reference a resource absent from the archive`);
+    fail(`${missing.length} screencast frame(s) reference missing resources`);
+  }
+} else if (beforeActions.length) {
+  console.log('  ❌ no screencast frames at all — the viewer shows no filmstrip');
+  fail('no screencast-frame lines: the viewer has no filmstrip to draw');
+} else {
+  console.log('  (no actions recorded, nothing to stream)');
+}
+
+// ── Viewer contract: action duration ──────────────────────────────────────────
 const durations = [];
-for (const b of befores) {
+for (const b of beforeActions) {
   const a = afters.find(x => x.callId === b.callId);
   if (a && typeof a.endTime === 'number' && typeof b.startTime === 'number')
     durations.push(a.endTime - b.startTime);

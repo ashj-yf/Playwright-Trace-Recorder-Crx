@@ -462,15 +462,10 @@ async function generatePlaywrightTraceInBrowser(recording) {
         for (const att of (event.attachments || [])) {
           if (!att.resource) continue;
 
-          yield JSON.stringify({
-            type: 'screencast-frame',
-            pageId,
-            sha1: att.resource,
-            width: att.width || viewport.width,
-            height: att.height || viewport.height,
-            timestamp: snapTime,
-            frameSwapWallTime: event.endTime || eventTime
-          }) + '\n';
+          // The continuous screencast supplies the filmstrip; this full-detail
+          // screenshot is what the viewer shows in its attachments panel, where
+          // the downsampled filmstrip frame is not readable. Both are kept on
+          // purpose — they answer different questions.
 
           // Without any DOM snapshot the viewer would show a blank frame, so
           // fall back to displaying the screenshot itself (main frame only).
@@ -531,6 +526,23 @@ async function generatePlaywrightTraceInBrowser(recording) {
 
         if (attachments.length > 0) afterEvent.attachments = attachments;
         yield JSON.stringify(afterEvent) + '\n';
+
+      } else if (event.type === 'screencast-frame') {
+        // The continuous screencast: one line per frame, in arrival order. These
+        // are what the viewer draws as the filmstrip and repaints canvases from,
+        // and `frameSwapWallTime` is the field it pairs a snapshot against — so
+        // it must stay the absolute page-presentation instant recorded at
+        // capture time, unlike the trace-relative `timestamp`.
+        if (!event.sha1) continue;
+        yield JSON.stringify({
+          type: 'screencast-frame',
+          pageId,
+          sha1: event.sha1,
+          width: event.width || viewport.width,
+          height: event.height || viewport.height,
+          timestamp: relTime(event.timestamp || eventTime),
+          frameSwapWallTime: event.frameSwapWallTime || event.timestamp || eventTime
+        }) + '\n';
 
       } else if (event.type === 'console') {
         yield JSON.stringify({

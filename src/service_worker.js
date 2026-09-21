@@ -40,14 +40,72 @@ const LIMITS = {
   maxCssBytes: 32 * 1024 * 1024,
   maxSnapshotBytes: 256 * 1024 * 1024,
   maxScreenshotBytes: 64 * 1024 * 1024,
+  // The continuous screencast is what makes the viewer's filmstrip move; it is
+  // the one capture stream that runs for the whole recording, so it gets its own
+  // budget instead of competing with the per-action screenshots.
+  maxScreencastBytes: 128 * 1024 * 1024,
   // Distinct network requests tracked.
   maxTrackedRequests: 3000,
   // Hard ceiling on recorded events.
   maxEvents: 20000,
+  // Screencast frames are capped separately: at ~15 fps they would race through
+  // maxEvents within minutes and, because that counter also gates action-stage
+  // snapshots, a long recording would silently lose snapshot detail.
+  maxScreencastFrames: 60000,
   // Actions may arrive faster than snapshots can be captured; beyond this depth
   // actions are still recorded but without DOM snapshots.
   maxQueuedCaptures: 4
 };
+
+/**
+ * Screencast capture parameters.
+ *
+ * These mirror the official recorder (playwright-core `server/screencast.js`
+ * plus `server/chromium/crPage.js`): frames are deliberately downsampled. The
+ * screencast is a coarse "what was on screen" track that the viewer draws as a
+ * filmstrip; the full-detail record is the DOM snapshot. Keeping every frame at
+ * device resolution instead produced ~150 KB frames at ~1.5 fps — both heavier
+ * and far less smooth than the official's ~3.6 KB at ~15 fps.
+ *
+ * The reference recorder caps the longest edge to 800 CSS px at jpeg quality 90.
+ */
+const SCREENCAST_LONG_EDGE = 800;
+const SCREENCAST_QUALITY = 90;
+// Guards against a truncated/empty payload being hashed and written as a
+// "frame". A real jpeg frame is orders of magnitude larger.
+const SCREENCAST_MIN_FRAME_BYTES = 256;
+
+/**
+ * Frame-rate policy, mirroring the official recorder's throttling.
+ *
+ * CDP pushes frames as fast as the page repaints (~60 fps). Keeping all of them
+ * is untenable — measured on an animating page, a 5.5 s clip produced 258 frames
+ * at ~34 KB each, about 90 MB per minute, against ~180 KB for a comparable
+ * official trace. So frames are DROPPED, never delayed.
+ *
+ * The official recorder (playwright-core `tracing.js`) keeps roughly one frame
+ * per `throttledRate` (200 ms) while the page is static, then runs unthrottled
+ * for `unthrottleDuration` (500 ms) around every action. That is what makes an
+ * action read as motion while a quiet stretch costs almost nothing. Both halves
+ * matter: throttling alone would make actions choppy, and never throttling is
+ * the 90 MB/min case above.
+ *
+ * The ack is always sent, even for a dropped frame: withholding it throttles
+ * CDP itself, and a frame left unacked stalls the stream permanently.
+ */
+const SCREENCAST_THROTTLE_MS = 200;
+const SCREENCAST_UNTHROTTLE_MS = 500;
+
+/**
+ * Keep every frame for a short window around an action.
+ *
+ * Mirrors the official `_temporarilyDisableThrottling`, which it calls on the
+ * before/input/after call of every action.
+ */
+function unthrottleScreencast(rec) {
+  if (!rec) return;
+  rec.screencastUnthrottledUntil = Date.now() + SCREENCAST_UNTHROTTLE_MS;
+}
 
 let activeRecording = null;
 
@@ -194,6 +252,165 @@ async function storeResource(rec, bytes, extension, budgetKey, budgetLimit) {
 
 // ── Recording lifecycle ───────────────────────────────────────────────────────
 
+/**
+ * Viewport-capped screencast frame size, in CSS pixels.
+ *
+ * Mirrors the official recorder: scale the viewport down so its longest edge is
+ * at most SCREENCAST_LONG_EDGE, then round to even numbers (CDP adjusts odd
+ * dimensions silently, which would desync the declared size from the pixels).
+ */
+function screencastSize(rec) {
+  const vp = rec.viewport || { width: 1280, height: 720 };
+  const longest = Math.max(vp.width || 1, vp.height || 1);
+  const scale = Math.min(1, SCREENCAST_LONG_EDGE / longest);
+  return {
+    width: Math.max(2, Math.floor((vp.width || 2) * scale) & ~1),
+    height: Math.max(2, Math.floor((vp.height || 2) * scale) & ~1)
+  };
+}
+
+/**
+ * Begin the continuous screencast.
+ *
+ * This is the one capture stream that runs for the whole recording, and it is
+ * what the viewer's filmstrip and canvas repaint are drawn from. Capturing a
+ * screenshot per action instead (the previous approach) produced frames only at
+ * action boundaries: 1.5 fps over a session, versus ~15 fps here.
+ */
+async function startScreencast(rec) {
+  if (!rec.debuggeeTabId || rec.screencastActive) return;
+  const { width, height } = screencastSize(rec);
+  try {
+    await cdpSend(rec, '', 'Page.startScreencast', {
+      format: 'jpeg',
+      quality: SCREENCAST_QUALITY,
+      maxWidth: width,
+      maxHeight: height,
+      everyNthFrame: 1
+    });
+    rec.screencastActive = true;
+    rec.screencastMax = { width, height };
+    console.log(`Screencast started (max ${width}x${height})`);
+  } catch (e) {
+    console.warn('Could not start screencast:', e.message);
+  }
+}
+
+/** Stop the stream; frames already in flight are drained by screencastChain. */
+async function stopScreencast(rec) {
+  if (!rec.debuggeeTabId || !rec.screencastActive) return;
+  rec.screencastActive = false;
+  try {
+    await cdpSend(rec, '', 'Page.stopScreencast');
+    console.log(`Screencast stopped after ${rec.screencastFrames} frames`);
+  } catch (e) {
+    console.warn('Could not stop screencast:', e.message);
+  }
+}
+
+/**
+ * Persist one screencast frame and append its `screencast-frame` line.
+ *
+ * CDP will not send the next frame until the previous one is acked, so the ack
+ * is the backpressure valve: it is only sent once the bytes are in IndexedDB.
+ * Acking first would let frames pile up in the worker heap under load, which is
+ * exactly what `maxQueuedCaptures` exists to prevent elsewhere.
+ *
+ * @param {Object} rec Recording state.
+ * @param {Object} params CDP Page.screencastFrame params.
+ */
+function handleScreencastFrame(rec, params) {
+  // Throttle decision, made synchronously before anything is queued: the
+  // unthrottled window around an action must be judged against the moment the
+  // frame arrived, not the moment the write chain gets to it.
+  const now = Date.now();
+  const unthrottled = now < (rec.screencastUnthrottledUntil || 0);
+  if (!unthrottled && now - (rec.screencastLastKept || 0) < SCREENCAST_THROTTLE_MS) {
+    // Dropped for rate. The ack still goes out immediately — CDP sends exactly
+    // one frame at a time, so a withheld ack would stop the stream rather than
+    // slow it.
+    rec.dropped.screencastThrottled++;
+    if (rec.debuggeeTabId) {
+      cdpSend(rec, '', 'Page.screencastFrameAck', { sessionId: params.sessionId })
+        .catch(() => {});
+    }
+    return;
+  }
+  rec.screencastLastKept = now;
+
+  // Serialize: the ack for frame N must not be sent before frame N is written,
+  // and two frames must not interleave their IndexedDB writes.
+  rec.screencastChain = rec.screencastChain
+    .then(() => storeScreencastFrame(rec, params))
+    .catch(err => console.warn('Screencast frame failed:', err.message))
+    .then(() => {
+      // Release the next frame only after this one is durable. A frame dropped
+      // by a budget still gets acked, or the stream would stall permanently.
+      if (rec.debuggeeTabId) {
+        cdpSend(rec, '', 'Page.screencastFrameAck', { sessionId: params.sessionId })
+          .catch(() => {});
+      }
+    });
+}
+
+async function storeScreencastFrame(rec, params) {
+  const meta = params.metadata || {};
+  const base64 = params.data || '';
+  if (!base64) return;
+
+  const bytes = base64ToUint8Array(base64);
+  if (bytes.byteLength < SCREENCAST_MIN_FRAME_BYTES) return;
+
+  const name = await storeResource(
+    rec, bytes, '.jpeg', 'screencast', LIMITS.maxScreencastBytes);
+  if (!name) return;
+
+  // `frameSwapWallTime` is the page's own frame-presentation instant, and the
+  // viewer pairs a snapshot to a frame by exactly this field. CDP reports it in
+  // seconds since the epoch; the viewer compares it against a millisecond
+  // `wallTime`, so the unit must be converted here.
+  const swapWallTime = meta.timestamp
+    ? meta.timestamp * 1000
+    : Date.now();
+
+  // Declare the frame's real pixel size, read back from the JPEG header rather
+  // than assumed from the requested cap: CDP scales to fit `maxWidth`/
+  // `maxHeight` while preserving aspect ratio, so the encoded frame is often
+  // smaller than the requested box.
+  const dims = jpegSize(bytes) || rec.screencastMax || { width: 0, height: 0 };
+
+  rec.screencastFrames++;
+
+  // Screencast lines do not go through the shared event ceiling: at ~15 fps a
+  // long recording would exhaust maxEvents, and that same counter decides
+  // whether an action may keep its action-stage snapshot — so the filmstrip
+  // would silently starve the DOM record.
+  if (rec.screencastFrames > LIMITS.maxScreencastFrames) {
+    rec.dropped.screencast++;
+    return;
+  }
+  try {
+    // Both instants are stored absolute, like every other event; the exporter
+    // rebases them onto the trace's own zero. A frame can be the very first
+    // event of a recording, and it is then what defines that zero — a relative
+    // value here would make every later timestamp meaningless.
+    await putEvent(rec.session, {
+      type: 'screencast-frame',
+      pageId: 'page1',
+      sha1: name,
+      width: dims.width,
+      height: dims.height,
+      frameSwapWallTime: swapWallTime,
+      timestamp: swapWallTime
+    });
+  } catch (err) {
+    console.warn('Could not persist screencast frame:', err.message);
+    if (isQuotaError(err)) notifyLimit(rec, 'browser storage quota');
+  }
+}
+
+// ── Recording lifecycle ───────────────────────────────────────────────────────
+
 function createRecording(name, tabId) {
   return {
     session: crypto.randomUUID(),
@@ -235,13 +452,28 @@ function createRecording(name, tabId) {
     // Per-frame last after-snapshot ids: ourFrameId -> snapshot id.
     lastSnapshotIds: {},
 
+    // ── Continuous screencast ──
+    // The viewer's filmstrip is drawn from `screencast-frame` lines, which the
+    // official recorder emits continuously for the whole session. Frames are
+    // written to IndexedDB through this chain so the ack that releases the next
+    // frame never overtakes the write of the current one.
+    screencastChain: Promise.resolve(),
+    screencastFrames: 0,
+    screencastActive: false,
+    screencastMax: null,
+    // Frame-rate policy state: when the unthrottled window ends, and when the
+    // last frame was actually kept (see handleScreencastFrame).
+    screencastUnthrottledUntil: 0,
+    screencastLastKept: 0,
+
     // Counters only; the log itself lives in IndexedDB.
     eventCount: 0,
     trackedRequestCount: 0,
-    bytes: { network: 0, css: 0, snapshots: 0, screenshots: 0 },
+    bytes: { network: 0, css: 0, snapshots: 0, screenshots: 0, screencast: 0 },
     dropped: {
       network: 0, oversize: 0, css: 0, snapshots: 0, screenshots: 0,
-      events: 0, requests: 0, postData: 0, actionSnapshots: 0
+      events: 0, requests: 0, postData: 0, actionSnapshots: 0, screencast: 0,
+      screencastThrottled: 0
     },
     pendingWrites: new Set(),
     // All request-record mutations serialize through this chain so get/merge/put
@@ -260,6 +492,7 @@ function sessionInfo(rec) {
     url: rec.url,
     viewport: rec.viewport,
     deviceScaleFactor: rec.deviceScaleFactor,
+    screencastFrames: rec.screencastFrames,
     cssRefs: [...rec.cssRefs.entries()]
   };
 }
@@ -341,6 +574,9 @@ async function startRecording(name, tabId) {
       }
     }
     persistSession(rec);
+    // Start last: the frame size is derived from the viewport, which only the
+    // first snapshot knows.
+    await startScreencast(rec);
   }
 
   if (tabId) {
@@ -381,9 +617,17 @@ async function stopRecording() {
   settlePendingFill('stop');
   try { await captureChain; } catch (_) {}
 
+  // Stop the stream before detaching: with the debugger gone the frames can no
+  // longer be acked, so any still in flight would be lost silently.
+  await stopScreencast(activeRecording);
+
   const recording = activeRecording;
   activeRecording = null;
   console.log(`Recording stopped: ${recording.name}`);
+
+  // The final frames are mid-write when the stream stops; drain that chain
+  // before the session is archived, or the tail of the filmstrip goes missing.
+  try { await recording.screencastChain; } catch (_) {}
 
   if (recording.debuggeeTabId) {
     try {
@@ -426,12 +670,22 @@ function logRecordingStats(rec) {
     `[Recording] ${rec.eventCount} events, ` +
     `snapshots ${mb(rec.bytes.snapshots)}, network ${mb(rec.bytes.network)}, ` +
     `css ${mb(rec.bytes.css)}, screenshots ${mb(rec.bytes.screenshots)}, ` +
+    `screencast ${mb(rec.bytes.screencast)} (${rec.screencastFrames} frames), ` +
     `${rec.resourceNames.size} resources, ${rec.frames.size} frames`
   );
   const dropped = Object.entries(rec.dropped).filter(([, v]) => v > 0);
-  if (dropped.length) {
+  // Rate-limited frames are ordinary operation, not a degraded capture: the
+  // policy deliberately keeps only ~5 fps while the page is static. Reporting
+  // them as "limits hit" would cry wolf on every healthy recording.
+  const throttled = rec.dropped.screencastThrottled;
+  const limited = dropped.filter(([k]) => k !== 'screencastThrottled');
+  if (throttled > 0) {
+    console.log(`[Recording] Screencast rate-limited ${throttled} frame(s) while idle ` +
+      `(kept ${rec.screencastFrames})`);
+  }
+  if (limited.length) {
     console.warn('[Recording] Budget limits hit:',
-      dropped.map(([k, v]) => `${k}=${v}`).join(', '));
+      limited.map(([k, v]) => `${k}=${v}`).join(', '));
   }
 }
 
@@ -1274,21 +1528,25 @@ async function cacheStylesheets(rec, frame, hrefs) {
  * applies exactly to the human-paced actions it was added for.
  *
  * @param {Object} rec Recorder state.
- * @returns {Promise<void>} Resolves once quiet, on timeout, or immediately when
- *   settling is skipped — it must never block a recording.
+ * @returns {Promise<number|null>} The page's own reaction time in ms, or null
+ *   when settling was skipped and no measurement was made. Never blocks a
+ *   recording.
  */
 async function settleDom(rec) {
-  if (!rec.debuggeeTabId) return;
-  if (captureQueueDepth > 1) return;      // another action is already waiting
+  if (!rec.debuggeeTabId) return null;
+  if (captureQueueDepth > 1) return null;   // another action is already waiting
   // Read the frame registry directly rather than through refreshFrames():
   // captureDomSnapshot() refreshes immediately afterwards, and the full refresh
   // can await frame attachment and owner-index resolution, which would make
   // every action pay for it twice.
   const main = mainFrameEntry(rec);
-  if (!main) return;
+  if (!main) return null;
   try {
-    await evaluateFrame(rec, main, DOM_SETTLE_EXPR, true);
-  } catch (_) { /* settling is best-effort */ }
+    const reaction = await evaluateFrame(rec, main, DOM_SETTLE_EXPR, true);
+    return Number.isFinite(reaction) ? reaction : null;
+  } catch (_) {
+    return null;                            // settling is best-effort
+  }
 }
 
 /** The main frame's registry entry, or null before the tree is known. */
@@ -1304,7 +1562,14 @@ const SETTLE_SILENCE_MS = 120;
 const SETTLE_TIMEOUT_MS = 1200;
 
 /**
- * Resolves when the DOM has been mutation-free for the quiet period.
+ * Resolves with the page's own reaction time, in milliseconds.
+ *
+ * The resolved number is when the DOM last changed after the action (or when
+ * the initial frame drain completed, if it never changed) — measured inside the
+ * page, on the page's clock. That is the honest "how long did this action take"
+ * value: the recorder's own settle window, snapshot capture and screenshot all
+ * happen after it, and counting those would report the cost of *recording* the
+ * action as if it were the cost of the action.
  *
  * Two frame drains run first, because the action's own handler may not have run
  * yet; observing from before it starts is what makes the quiet period mean
@@ -1315,15 +1580,23 @@ const DOM_SETTLE_EXPR = `(function(){
   return new Promise(function(resolve){
     var SILENCE = ${SETTLE_SILENCE_MS}, CEILING = ${SETTLE_TIMEOUT_MS};
     var done = false, quietTimer = null, hardTimer = null, observer = null;
+    var t0 = performance.now();
+    // -1 until something is observed; a page with no observer is not a
+    // reaction, so it reports 0 rather than the settle window.
+    var lastChange = -1;
+    var started = false;
     function finish(){
       if(done) return;
       done = true;
       clearTimeout(quietTimer); clearTimeout(hardTimer);
       if(observer){ try { observer.disconnect(); } catch(e){} }
-      resolve(true);
+      resolve(lastChange < 0 ? 0 : Math.max(0, lastChange));
     }
     function restarted(){
-      clearTimeout(quietTimer);
+      lastChange = performance.now() - t0;
+      // The quiet timer only arms once the initial drain has finished, so an
+      // action's own first mutation is never mistaken for the drain itself.
+      if(started) clearTimeout(quietTimer);
       quietTimer = setTimeout(finish, SILENCE);
     }
     try {
@@ -1335,7 +1608,9 @@ const DOM_SETTLE_EXPR = `(function(){
     hardTimer = setTimeout(finish, CEILING);
     // Drain two frames, then start counting quiet: without a mutation after
     // that, the action did not disturb the DOM and waiting longer is pointless.
-    requestAnimationFrame(function(){ requestAnimationFrame(restarted); });
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ started = true; restarted(); });
+    });
   });
 })()`;
 
@@ -1480,11 +1755,27 @@ function enqueueAction(event) {
   }
   const rec = activeRecording;
 
+  // Stamp arrival before anything can queue: the viewer's action span must start
+  // when the interaction reached us, not when the backlog let the job run.
+  if (!Number.isFinite(event.arrivedAt)) event.arrivedAt = Date.now();
+  if (!Number.isFinite(event.burstEndAt)) event.burstEndAt = event.arrivedAt;
+
+  // Capture the action in full frame rate. Official does this for each of the
+  // before/input/after calls; doing it on arrival plus from the recorder below
+  // keeps every phase of the action inside one unthrottled window.
+  unthrottleScreencast(rec);
+
   if (event.type === 'fill') {
     if (pendingFill && !pendingFill.settled &&
         pendingFill.selector === event.selector) {
-      // Same burst: refresh the value its (already queued) job will record.
+      // Same burst: refresh the value its (already queued) job will record. The
+      // burst's start stays the first keystroke's, so one merged Page.fill
+      // action reports the whole typing burst rather than its last keystroke;
+      // the page's reaction is measured from the LAST keystroke.
+      const startedAt = pendingFill.event.arrivedAt;
       pendingFill.event = event;
+      event.arrivedAt = startedAt;
+      event.burstEndAt = Date.now();
       clearTimeout(pendingFill.idleTimer);
       pendingFill.idleTimer = setTimeout(() => settlePendingFill('idle'), FILL_IDLE_MS);
       return;
@@ -1549,15 +1840,29 @@ async function recordAction(rec, event, opts) {
   if (rec !== activeRecording) return;
 
   const callId = `call@${Date.now()}@${Math.floor(Math.random() * 1000)}`;
-  const timestamp = Date.now();
+  // The action's start is when the interaction actually reached the recorder,
+  // not when this queued job happened to run: under backlog the two differ by
+  // the whole queue wait, and the viewer draws the span between them.
+  const timestamp = Number.isFinite(event.arrivedAt) ? event.arrivedAt : Date.now();
   const attachments = [];
 
   const beforeSnapshotIds = { ...rec.lastSnapshotIds };
+
+  // Re-arm the unthrottled window for this action's own capture phases. The
+  // burst above may have happened a moment ago, and the page's visible reaction
+  // to the action is exactly what must be recorded at full rate.
+  unthrottleScreencast(rec);
 
   // captureDomSnapshot returns {frameId: {id, url, viewport}}; events reference
   // snapshots by id only, so flatten to {frameId: id}.
   const flatSnapshotIds = captured =>
     Object.fromEntries(Object.entries(captured).map(([fid, snap]) => [fid, snap.id]));
+
+  // How long the PAGE took to react to this action, measured inside the page.
+  // Everything the recorder does afterwards (settling, snapshot capture,
+  // screenshots, IndexedDB writes) is our cost, not the action's, and must not
+  // be reported as its duration.
+  let reactionMs = null;
 
   let actionSnapshotIds = {};
   if (opts.withActionSnapshot) {
@@ -1566,7 +1871,7 @@ async function recordAction(rec, event, opts) {
     // before that work lands, so capturing immediately records the transitional
     // state — which is precisely the view the trace viewer opens on. Wait for
     // the DOM to go quiet first.
-    await settleDom(rec);
+    reactionMs = await settleDom(rec);
     if (rec !== activeRecording) return;
     actionSnapshotIds = flatSnapshotIds(await captureDomSnapshot(rec, {
       targetSelector: event.selector,
@@ -1642,7 +1947,9 @@ async function recordAction(rec, event, opts) {
   if (rec.debuggeeTabId) {
     // Only wait out the render when no settle already happened for the action
     // stage; otherwise this is the tail of the same reaction.
-    if (!opts.withActionSnapshot) await settleDom(rec);
+    if (!opts.withActionSnapshot) {
+      reactionMs = await settleDom(rec);
+    }
     if (rec !== activeRecording) return;
     const afterResult = await captureDomSnapshot(rec);
     afterSnapshotIds = flatSnapshotIds(afterResult);
@@ -1657,16 +1964,33 @@ async function recordAction(rec, event, opts) {
     persistSession(rec);
   }
 
-  // The action's real duration: from the event arriving to the page having
-  // settled. The viewer draws this span on the timeline, so a fixed number
-  // misrepresents every action's cost.
-  const endTime = Date.now();
+  // The action's real duration: arrival to the page having reacted. Taking
+  // Date.now() here instead would fold in settleDom's quiet window, the DOM
+  // snapshot round trip and the screenshot — all recorder cost — and every
+  // action would report a near-constant ~670 ms regardless of what the page
+  // did. The viewer draws this span on the timeline, so it must describe the
+  // page, not the recorder.
+  //
+  // A merged typing burst starts at its first keystroke but the page only
+  // reacts to the last one, so its reaction is added to the burst's end.
+  //
+  // When the page never reacted (reactionMs === null: settling was skipped
+  // under backlog, or the frame was not ready) the honest answer is the brief
+  // moment we actually held the action, not an invented render time.
+  const reactionBase = Math.max(
+    timestamp, Number.isFinite(event.burstEndAt) ? event.burstEndAt : timestamp);
+  const endTime = Number.isFinite(reactionMs) && reactionMs > 0
+    ? reactionBase + Math.round(reactionMs)
+    : Date.now();
+  // Guard against a page clock that disagrees with ours: the span must never
+  // run backwards, and must not swallow the recorder's own tail either.
+  const clampedEnd = Math.min(Math.max(endTime, timestamp), Date.now());
 
   await logEvent(rec, {
     type: 'after',
     callId,
-    endTime,
-    timestamp: endTime,
+    endTime: clampedEnd,
+    timestamp: clampedEnd,
     attachments,
     afterSnapshotIds
   });
@@ -1872,6 +2196,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   const timestamp = Date.now();
   const sessionId = params && params.sessionId ? params.sessionId : '';
+
+  // The continuous screencast. This must be handled before anything that can
+  // await: a frame left unacked stalls the stream, and CDP sends exactly one
+  // frame at a time, so a slow handler directly becomes a dropped frame rate.
+  if (method === 'Page.screencastFrame') {
+    handleScreencastFrame(rec, params);
+    return;
+  }
 
   if (method === 'Target.attachedToTarget') {
     const job = handleAttached(rec, params.sessionId, params.targetInfo)
