@@ -198,6 +198,10 @@ async function generatePlaywrightTraceInBrowser(recording) {
   const nowWall = Date.now();
   const mainFrameId = recording.mainFrameId || ('frame@' + id.substring(0, 8));
   const viewport = recording.viewport || { width: 1280, height: 720 };
+  // Screencast frames are captured at device pixels while the viewport above is
+  // in CSS pixels; declaring the real ratio is what keeps the two consistent.
+  const scaleFactor = Number.isFinite(recording.deviceScaleFactor) && recording.deviceScaleFactor > 0
+    ? recording.deviceScaleFactor : 1;
 
   // Base time is the first event's timestamp. Events live in IDB, so prime the
   // iterator before opening the trace stream.
@@ -218,7 +222,7 @@ async function generatePlaywrightTraceInBrowser(recording) {
     endTime: relTime(nowWall),
     wallTime: baseTime,
     browserName: 'chromium',
-    options: { viewport, deviceScaleFactor: 1, isMobile: false },
+    options: { viewport, deviceScaleFactor: scaleFactor, isMobile: false },
     pages: [{
       pageId,
       url: recording.url || '',
@@ -279,6 +283,13 @@ async function generatePlaywrightTraceInBrowser(recording) {
       const html = referencerFor(effectiveFrameId)(
         neutralizeScripts(domSnap.html, snapshotName));
 
+      // `timestamp` is the monotonic offset the timeline is drawn against, but
+      // the viewer pairs a snapshot with the screencast frame that was on screen
+      // when it was taken by wall clock (snapshotRenderer.closestScreenshot).
+      // The page stamps that instant at capture time; fall back to the derived
+      // offset only if it is missing, which degrades pairing but stays valid.
+      const wallTime = Number.isFinite(domSnap.wallTime) ? domSnap.wallTime : snapTime;
+
       lines.push(JSON.stringify({
         type: 'frame-snapshot',
         snapshot: {
@@ -291,7 +302,7 @@ async function generatePlaywrightTraceInBrowser(recording) {
           html,
           viewport: domSnap.viewport || viewport,
           timestamp: snapTime,
-          wallTime: snapTime,
+          wallTime,
           collectionTime: 0,
           resourceOverrides,
           isMainFrame: !!domSnap.isMainFrame || effectiveFrameId === mainFrameId
@@ -313,7 +324,7 @@ async function generatePlaywrightTraceInBrowser(recording) {
       channel: '',
       options: {
         viewport,
-        deviceScaleFactor: 1,
+        deviceScaleFactor: scaleFactor,
         isMobile: false,
         hasTouch: false,
         javaScriptEnabled: true
@@ -497,7 +508,10 @@ async function generatePlaywrightTraceInBrowser(recording) {
                     html,
                     viewport,
                     timestamp: snapTime,
-                    wallTime: snapTime,
+                    // No page-stamped capture instant exists for a synthetic
+                    // frame; the action's absolute end time is the closest
+                    // truthful wall clock, and keeps pairing working.
+                    wallTime: event.endTime || eventTime,
                     collectionTime: 0,
                     resourceOverrides,
                     isMainFrame: true

@@ -96,13 +96,41 @@ recoverOrphanSessions().catch(err => console.warn('Could not recover stale sessi
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Downscale screenshots to fit within max dimensions (Playwright style)
-function inscribe(object, area) {
-  const scale = Math.max(object.width / area.width, object.height / area.height);
-  return {
-    width: object.width / scale | 0,
-    height: object.height / scale | 0
-  };
+/**
+ * Reads a JPEG's intrinsic pixel size from its SOF marker.
+ *
+ * The CDP screenshot response carries only the encoded bytes, so the real
+ * dimensions have to come out of the file. Header-only scan, no decoding.
+ *
+ * @param {Uint8Array} bytes A complete JPEG.
+ * @returns {{width:number, height:number}|null} null when unparseable.
+ */
+function jpegSize(bytes) {
+  if (!bytes || bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  let i = 2;                                    // past SOI
+  while (i + 9 < bytes.length) {
+    if (bytes[i] !== 0xff) { i++; continue; }   // resynchronise on marker prefix
+    const marker = bytes[i + 1];
+    // Start-of-frame markers carry the dimensions; DHT/JPG/DAC sit in the same
+    // numeric range but are not frames.
+    if (marker >= 0xc0 && marker <= 0xcf &&
+        marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return {
+        height: (bytes[i + 5] << 8) | bytes[i + 6],
+        width: (bytes[i + 7] << 8) | bytes[i + 8]
+      };
+    }
+    const length = (bytes[i + 2] << 8) | bytes[i + 3];
+    if (length <= 0) break;                     // malformed; avoid a spin
+    i += 2 + length;
+  }
+  return null;
+}
+
+/** Device pixel ratio, defaulting to 1 when the page never reported one. */
+function deviceScaleFactor(rec) {
+  const dsf = rec && rec.deviceScaleFactor;
+  return Number.isFinite(dsf) && dsf > 0 ? dsf : 1;
 }
 
 function base64ToUint8Array(base64) {
@@ -176,6 +204,9 @@ function createRecording(name, tabId) {
     debuggeeTabId: tabId || null,
     url: null,
     viewport: null,
+    // Device pixel ratio reported by the page; reconciles the CSS-pixel
+    // viewport with device-pixel screencast frames at export time.
+    deviceScaleFactor: null,
 
     // ── Frame registry (multi-frame capture) ──
     // cdpFrameId -> entry:
@@ -228,6 +259,7 @@ function sessionInfo(rec) {
     mainFrameId: rec.mainFrameId,
     url: rec.url,
     viewport: rec.viewport,
+    deviceScaleFactor: rec.deviceScaleFactor,
     cssRefs: [...rec.cssRefs.entries()]
   };
 }
@@ -451,6 +483,7 @@ async function runRecovery(keepSession = null) {
         startTime: info.startTime || Date.now(),
         url: info.url || null,
         viewport: info.viewport || null,
+        deviceScaleFactor: info.deviceScaleFactor || null,
         mainFrameId: info.mainFrameId || ('frame@' + (info.session || '').replace(/-/g, '').slice(0, 8)),
         cssRefs: new Map(info.cssRefs || []),
         recovered: true
@@ -871,6 +904,7 @@ const PAGE_INFO_EXPR = `(function(){
     url: window.location.href,
     doctype: dt ? dt.name : 'html',
     viewport: { width: window.innerWidth, height: window.innerHeight },
+    deviceScaleFactor: window.devicePixelRatio || 1,
     stylesheets: urls
   });
 })()`;
@@ -881,21 +915,50 @@ const PAGE_INFO_EXPR = `(function(){
  * Beyond plain elements it reproduces the viewer's own snapshot conventions:
  *  - `__playwright_value_` / `__playwright_checked_` / `__playwright_selected_`
  *    carry live form state (attributes alone hold only the default values),
+ *  - `__playwright_scroll_top_` / `_left_` carry scroll offsets, so the viewer
+ *    restores what was on screen instead of pinning every container to the top,
+ *  - `__playwright_bounding_rect_` on canvas/iframe/frame, without which the
+ *    viewer refuses to repaint a canvas from the screencast,
+ *  - `__playwright_popover_open_` / `__playwright_dialog_open_` for overlay
+ *    visibility that markup alone cannot express,
+ *  - `__playwright_target__` on the element an action addressed, which the
+ *    viewer outlines in the snapshot,
  *  - open Shadow DOM is encoded as a TEMPLATE[__playwright_shadow_root_] child,
  *  - constructable/adopted stylesheets travel as TEMPLATE[__playwright_style_sheet_],
  *  - iframe elements are tagged with the recorder frame id (`__pw_frame__`) and
  *    rewritten to the viewer's `/snapshot/<frame>/<name>` route at export time,
  *  - <style>/<script> text, which carries whole stylesheets or sources, is
  *    never capped like ordinary text nodes.
+ *
+ * @param {string} frameMapJson ownerIndex -> frame id map for child frames.
+ * @param {string} fid This frame's recorder id.
+ * @param {boolean} isMain Whether this is the main frame.
+ * @param {string} [targetSelector] Selector of the element the action addressed.
+ * @param {string} [targetCallId] callId to stamp on it (matches the snapshot line).
  */
-function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
+function buildDomSnapshotExpr(frameMapJson, fid, isMain, targetSelector, targetCallId) {
   return `(function(){
   try{
     var MAX_NODES = 60000, MAX_TEXT = 5000, nodes = 0, truncated = false;
     var FRAME_MAP = ${frameMapJson};
     var FID = ${JSON.stringify(fid)};
     var MAIN = ${isMain ? 'true' : 'false'};
+    var TARGET_SELECTOR = ${JSON.stringify(targetSelector || '')};
+    var TARGET_CALL_ID = ${JSON.stringify(targetCallId || '')};
     var frameIdx = 0;
+    // Mark the action's target so the serializer picks it up, and unmark it
+    // afterwards: the expando lives on a live page element and would otherwise
+    // leak a stale target into every later snapshot.
+    var marked = null;
+    if(TARGET_SELECTOR && TARGET_CALL_ID){
+      try {
+        var hits = document.querySelectorAll(TARGET_SELECTOR);
+        if(hits.length === 1){ marked = hits[0]; marked.__playwright_target__ = TARGET_CALL_ID; }
+      } catch(e){ marked = null; }
+    }
+    function unmarkTarget(){
+      if(marked){ try { delete marked.__playwright_target__; } catch(e){} marked = null; }
+    }
     function sheetText(sheet){
       var out = [], i;
       try {
@@ -911,6 +974,11 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
       if(t.trim()) return t;
       return sheetText(el.sheet);
     }
+    // Element state the viewer restores reactively. Mirrors the attribute set
+    // playwright-core's snapshotterInjected writes, because snapshotRenderer
+    // reads exactly these names: a missing marker is not a cosmetic loss —
+    // canvases without a bounding rect are skipped outright, and a scroll
+    // container without a scroll marker is pinned back to scrollTop 0.
     function applyLiveState(n, a){
       var tn = n.tagName;
       if(tn === 'INPUT'){
@@ -925,6 +993,40 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
       } else if(tn === 'OPTION'){
         a['__playwright_selected_'] = n.selected ? 'true' : 'false';
       }
+      // Canvas contents are repainted from the screencast, but only when the
+      // canvas carries where it sat on screen. iframe/frame carry it too: the
+      // viewer accumulates these rects to place a nested frame's canvas.
+      if(tn === 'CANVAS' || tn === 'IFRAME' || tn === 'FRAME'){
+        try {
+          var r = n.getBoundingClientRect();
+          a['__playwright_bounding_rect_'] = JSON.stringify({
+            left: r.left, top: r.top, right: r.right, bottom: r.bottom
+          });
+        } catch(e){}
+      }
+      // Scroll offset. Written only when non-zero, like the official recorder,
+      // so unscrolled containers cost nothing.
+      try {
+        if(n.scrollTop) a['__playwright_scroll_top_'] = '' + n.scrollTop;
+        if(n.scrollLeft) a['__playwright_scroll_left_'] = '' + n.scrollLeft;
+      } catch(e){}
+      // Popovers/dialogs are opened by script at runtime, so their visibility
+      // cannot be inferred from markup alone.
+      try {
+        if(n.popover && n.matches && n.matches(':popover-open')){
+          a['__playwright_popover_open_'] = 'true';
+        }
+        if(tn === 'DIALOG' && n.open){
+          a['__playwright_dialog_open_'] = n.matches(':modal') ? 'modal' : 'true';
+        }
+      } catch(e){}
+      // The element an action targeted, keyed by callId; the viewer outlines
+      // every node matching the snapshot's own callId.
+      try {
+        if(n.__playwright_target__ != null && n.__playwright_target__ !== ''){
+          a['__playwright_target__'] = String(n.__playwright_target__);
+        }
+      } catch(e){}
     }
     // Resource URLs must be absolute: the trace viewer serves resources by
     // exact absolute-URL string match, so a snapshot keeping "/img.png" can
@@ -1036,13 +1138,14 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
         if(Array.isArray(node[i]) && node[i][0] === tag) return node[i];
       }
       for(var j = 2; j < node.length; j++){
-        var found = findTag(node[i], tag);
+        var found = findTag(node[j], tag);
         if(found) return found;
       }
       return null;
     }
     var dt = document.doctype;
     var tree = s(document.documentElement, 0);
+    unmarkTarget();
     if(!Array.isArray(tree)) return null;
     // Document-level adopted stylesheets: viewer replaces these via replaceSync.
     if(MAIN && document.adoptedStyleSheets && document.adoptedStyleSheets.length){
@@ -1061,11 +1164,18 @@ function buildDomSnapshotExpr(frameMapJson, fid, isMain) {
       frameId: FID,
       isMainFrame: MAIN,
       viewport: { width: window.innerWidth, height: window.innerHeight },
+      deviceScaleFactor: window.devicePixelRatio || 1,
+      // Absolute capture instant. The emitted frame-snapshot's timestamp is a
+      // relative offset, but the viewer pairs a snapshot with the screencast
+      // frame that was on screen when it was taken by comparing wall clocks, so
+      // this has to be a real epoch - as it is in the official recorder, which
+      // stamps Date.now() in the page.
+      wallTime: Date.now(),
       scrollX: window.scrollX,
       scrollY: window.scrollY,
       truncated: truncated
     });
-  } catch(e){ return null; }
+  } catch(e){ unmarkTarget(); return null; }
 })()`;
 }
 
@@ -1146,11 +1256,103 @@ async function cacheStylesheets(rec, frame, hrefs) {
 }
 
 /**
+ * Waits until the page's DOM has stopped changing, so a snapshot taken right
+ * after an action shows the settled result rather than a transitional frame.
+ *
+ * A click handler that starts framework work (re-render, fetch, animation)
+ * returns long before that work lands. Playwright's own recorder sidesteps this
+ * by capturing from the driver, which awaits the action; a CDP recorder never
+ * sees that boundary, so it has to infer it from the DOM itself.
+ *
+ * Resolves as soon as the DOM has been mutation-free for SETTLE_SILENCE_MS,
+ * counted from the first moment there is something to observe, with a hard
+ * SETTLE_TIMEOUT_MS ceiling for a page that never stops mutating.
+ *
+ * Skipped when actions are already backed up: settling is a latency/accuracy
+ * trade, and paying latency while behind makes the backlog worse — under load
+ * the capture queue's own gate is what protects the recording. Settling then
+ * applies exactly to the human-paced actions it was added for.
+ *
+ * @param {Object} rec Recorder state.
+ * @returns {Promise<void>} Resolves once quiet, on timeout, or immediately when
+ *   settling is skipped — it must never block a recording.
+ */
+async function settleDom(rec) {
+  if (!rec.debuggeeTabId) return;
+  if (captureQueueDepth > 1) return;      // another action is already waiting
+  // Read the frame registry directly rather than through refreshFrames():
+  // captureDomSnapshot() refreshes immediately afterwards, and the full refresh
+  // can await frame attachment and owner-index resolution, which would make
+  // every action pay for it twice.
+  const main = mainFrameEntry(rec);
+  if (!main) return;
+  try {
+    await evaluateFrame(rec, main, DOM_SETTLE_EXPR, true);
+  } catch (_) { /* settling is best-effort */ }
+}
+
+/** The main frame's registry entry, or null before the tree is known. */
+function mainFrameEntry(rec) {
+  for (const entry of rec.frames.values()) {
+    if (entry.main) return entry;
+  }
+  return null;
+}
+
+// Quiet period for DOM_SETTLE_EXPR, and its hard ceiling.
+const SETTLE_SILENCE_MS = 120;
+const SETTLE_TIMEOUT_MS = 1200;
+
+/**
+ * Resolves when the DOM has been mutation-free for the quiet period.
+ *
+ * Two frame drains run first, because the action's own handler may not have run
+ * yet; observing from before it starts is what makes the quiet period mean
+ * anything. A page that never mutates then settles after one quiet window, and
+ * one that renders on a timer is bounded by the ceiling.
+ */
+const DOM_SETTLE_EXPR = `(function(){
+  return new Promise(function(resolve){
+    var SILENCE = ${SETTLE_SILENCE_MS}, CEILING = ${SETTLE_TIMEOUT_MS};
+    var done = false, quietTimer = null, hardTimer = null, observer = null;
+    function finish(){
+      if(done) return;
+      done = true;
+      clearTimeout(quietTimer); clearTimeout(hardTimer);
+      if(observer){ try { observer.disconnect(); } catch(e){} }
+      resolve(true);
+    }
+    function restarted(){
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(finish, SILENCE);
+    }
+    try {
+      observer = new MutationObserver(restarted);
+      observer.observe(document.documentElement || document, {
+        childList: true, subtree: true, attributes: true, characterData: true
+      });
+    } catch(e){ finish(); return; }
+    hardTimer = setTimeout(finish, CEILING);
+    // Drain two frames, then start counting quiet: without a mutation after
+    // that, the action did not disturb the DOM and waiting longer is pointless.
+    requestAnimationFrame(function(){ requestAnimationFrame(restarted); });
+  });
+})()`;
+
+/**
  * Capture one DOM snapshot per frame, straight into IndexedDB.
+ *
+ * @param {Object} rec Recorder state.
+ * @param {Object} [opts]
+ * @param {string} [opts.targetSelector] Selector of the element the action
+ *   addressed; the frame containing it stamps `__playwright_target__` so the
+ *   viewer can outline it. Resolved per frame, so an iframe target marks the
+ *   element in whichever frame owns it.
+ * @param {string} [opts.targetCallId] callId to stamp (the snapshot line's own).
  * @returns {Object<string, {id:number, url:string, viewport:Object}>}
  *   ourFrameId -> snapshot record
  */
-async function captureDomSnapshot(rec) {
+async function captureDomSnapshot(rec, opts = {}) {
   if (!rec.debuggeeTabId) return {};
 
   const frames = await refreshFrames(rec);
@@ -1165,6 +1367,13 @@ async function captureDomSnapshot(rec) {
 
     if (pageInfo && pageInfo.stylesheets) {
       await cacheStylesheets(rec, frame, pageInfo.stylesheets);
+    }
+
+    // Device pixel ratio is a property of the device, so the first frame that
+    // reports one settles it for the whole recording. It is needed at export to
+    // reconcile CSS-pixel viewports with device-pixel screencast frames.
+    if (pageInfo && pageInfo.deviceScaleFactor && !rec.deviceScaleFactor) {
+      rec.deviceScaleFactor = pageInfo.deviceScaleFactor;
     }
 
     if (rec.bytes.snapshots >= LIMITS.maxSnapshotBytes) {
@@ -1185,7 +1394,9 @@ async function captureDomSnapshot(rec) {
 
     let json;
     try {
-      const expr = buildDomSnapshotExpr(JSON.stringify(childMap), frame.ourFrameId, !!frame.main);
+      const expr = buildDomSnapshotExpr(
+        JSON.stringify(childMap), frame.ourFrameId, !!frame.main,
+        opts.targetSelector || '', opts.targetCallId || '');
       json = await evaluateFrame(rec, frame, expr);
     } catch (e) {
       console.warn(`Failed to capture DOM snapshot for frame ${frame.ourFrameId}:`, e.message);
@@ -1291,11 +1502,14 @@ function enqueueAction(event) {
     pending.settledPromise = new Promise(resolve => { pending.resolve = resolve; });
     pendingFill = pending;
 
-    captureQueueDepth++;
+    // No capture slot is taken here: this job is only coalescing keystrokes and
+    // will wait FILL_IDLE_MS before doing anything. Counting that wait as
+    // backlog would make an idle typing burst look like capture pressure and
+    // wrongly deny action snapshots to whatever the user does next. The slot is
+    // acquired inside recordFillAction, when capturing actually starts.
     captureChain = captureChain
       .then(() => recordFillAction(rec, pending))
-      .catch(err => console.warn('Failed to record fill action:', err))
-      .then(() => { captureQueueDepth--; });
+      .catch(err => console.warn('Failed to record fill action:', err));
     return;
   }
 
@@ -1316,13 +1530,18 @@ async function recordFillAction(rec, pending) {
   await pending.settledPromise;
   // The recording may have been stopped while the burst was settling.
   if (rec !== activeRecording) return;
-  // Action-stage snapshot eligibility is evaluated now, not when the first
-  // keystroke landed: this job occupied a queue slot while waiting for the
-  // burst to settle, so the enqueue-time depth would deny the action snapshot
-  // to actions queued behind typing.
+  // Capturing starts now, so only now does this job occupy a capture slot. The
+  // action-stage decision is made against that same instant: the depth a job
+  // sees when it is finally ready to capture is the honest measure of pressure,
+  // not the depth left behind by an earlier job that was merely idle-waiting.
   const withActionSnapshot = captureQueueDepth < LIMITS.maxQueuedCaptures &&
     rec.eventCount < LIMITS.maxEvents;
-  await recordAction(rec, pending.event, { withActionSnapshot });
+  captureQueueDepth++;
+  try {
+    await recordAction(rec, pending.event, { withActionSnapshot });
+  } finally {
+    captureQueueDepth--;
+  }
 }
 
 async function recordAction(rec, event, opts) {
@@ -1342,7 +1561,17 @@ async function recordAction(rec, event, opts) {
 
   let actionSnapshotIds = {};
   if (opts.withActionSnapshot) {
-    actionSnapshotIds = flatSnapshotIds(await captureDomSnapshot(rec));
+    // The action stage is captured after the page has reacted. A click handler
+    // that triggers framework work (React/Vue re-render, data fetch) returns
+    // before that work lands, so capturing immediately records the transitional
+    // state — which is precisely the view the trace viewer opens on. Wait for
+    // the DOM to go quiet first.
+    await settleDom(rec);
+    if (rec !== activeRecording) return;
+    actionSnapshotIds = flatSnapshotIds(await captureDomSnapshot(rec, {
+      targetSelector: event.selector,
+      targetCallId: callId
+    }));
     if (rec !== activeRecording) return;
   } else {
     // Burst overflow: only the action-stage snapshot is suppressed (counted
@@ -1353,20 +1582,28 @@ async function recordAction(rec, event, opts) {
 
   if (rec.debuggeeTabId && rec.bytes.screenshots < LIMITS.maxScreenshotBytes) {
     try {
-      const { data, width, height } = await cdpSend(rec, '', 'Page.captureScreenshot', {
+      const { data } = await cdpSend(rec, '', 'Page.captureScreenshot', {
         format: 'jpeg', quality: 80
       });
       const bytes = base64ToUint8Array(data);
       const name = await storeResource(rec, bytes, '.jpeg', 'screenshots', LIMITS.maxScreenshotBytes);
       if (name) {
-        // Match Playwright's film strip sizing (max 800x600).
-        const scaled = inscribe({ width, height }, { width: 800, height: 600 });
+        // Declare the frame's true device-pixel size. CDP returns only the
+        // encoded image, so the real dimensions are read back from the JPEG
+        // itself; the CSS-pixel viewport times the device pixel ratio is the
+        // fallback when the header cannot be parsed. (CDP's own screencast
+        // reports real device pixels here too — never a scaled thumbnail.)
+        const dsf = deviceScaleFactor(rec);
+        const dims = jpegSize(bytes) || {
+          width: Math.round((rec.viewport?.width || 0) * dsf),
+          height: Math.round((rec.viewport?.height || 0) * dsf)
+        };
         attachments.push({
           name: 'Action Screenshot',
           contentType: 'image/jpeg',
           resource: name,
-          width: scaled.width,
-          height: scaled.height
+          width: dims.width,
+          height: dims.height
         });
       } else {
         notifyLimit(rec, 'screenshots');
@@ -1403,7 +1640,9 @@ async function recordAction(rec, event, opts) {
   // condition): a burst must never leave an action without its post-state.
   let afterSnapshotIds = {};
   if (rec.debuggeeTabId) {
-    await new Promise(resolve => setTimeout(resolve, 150));
+    // Only wait out the render when no settle already happened for the action
+    // stage; otherwise this is the tail of the same reaction.
+    if (!opts.withActionSnapshot) await settleDom(rec);
     if (rec !== activeRecording) return;
     const afterResult = await captureDomSnapshot(rec);
     afterSnapshotIds = flatSnapshotIds(afterResult);
@@ -1418,11 +1657,16 @@ async function recordAction(rec, event, opts) {
     persistSession(rec);
   }
 
+  // The action's real duration: from the event arriving to the page having
+  // settled. The viewer draws this span on the timeline, so a fixed number
+  // misrepresents every action's cost.
+  const endTime = Date.now();
+
   await logEvent(rec, {
     type: 'after',
     callId,
-    endTime: timestamp + 20,
-    timestamp: timestamp + 20,
+    endTime,
+    timestamp: endTime,
     attachments,
     afterSnapshotIds
   });

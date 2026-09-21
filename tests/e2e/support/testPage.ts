@@ -42,6 +42,19 @@ export const INLINE_SCRIPT_SENTINEL = 'inline-script-sentinel-7f3a';
 /** Element styled only through a document-level adopted stylesheet. */
 export const ADOPTED_SENTINEL = 'adopted-stylesheet-sentinel-2b81';
 
+/** Content that only becomes visible once the scroll container is scrolled. */
+export const SCROLLED_INTO_VIEW_TEXT = 'folded-content-only-visible-after-scroll';
+
+/** Scroll viewport height; content is taller so a scroll position is meaningful. */
+export const SCROLL_VIEWPORT_PX = 120;
+export const SCROLL_CONTENT_PX = 400;
+
+/** A canvas the viewer can only repaint from the screencast via its bbox. */
+export const CANVAS_ID = 'fidelity-canvas';
+
+/** Dialog opened by script, so its open state is not in the markup. */
+export const DIALOG_ID = 'fidelity-dialog';
+
 function bigInlineCss(): string {
   const rules = Array.from({ length: 700 },
     (_, i) => `.inline-${i}{padding:${i % 13}px;color:#${(i % 999).toString(16).padStart(3, '0')}}`);
@@ -86,6 +99,15 @@ ${burstButtons.join('\n')}
 <iframe id="childFrame" src="/frame.html"></iframe>
 <div id="shadow-host"></div>
 <div class="adopted-sentinel">${ADOPTED_SENTINEL}</div>
+<div id="scroll-viewport" style="height:${SCROLL_VIEWPORT_PX}px;overflow:auto;border:1px solid #ccc">
+  <div style="height:${SCROLL_CONTENT_PX}px;background:linear-gradient(#eef,#fee)">
+    <span id="scroll-top-marker">scrollable top content</span>
+    <div style="margin-top:${SCROLL_CONTENT_PX - 40}px"><span id="folded-content">${SCROLLED_INTO_VIEW_TEXT}</span></div>
+  </div>
+</div>
+<canvas id="${CANVAS_ID}" width="60" height="40" style="border:1px solid #333"></canvas>
+<button id="dialog-open">Open Dialog</button>
+<dialog id="${DIALOG_ID}">dialog body <button id="dialog-close">close</button></dialog>
 <img src="/small.png" width="20" height="20">
 <img src="/huge.png" width="20" height="20">
 <video src="/huge.mp4" poster="/small.png" preload="auto" muted></video>
@@ -123,6 +145,24 @@ ${burstButtons.join('\n')}
   // load via a separate pipeline whose body CDP cannot always return, while a
   // fetch() response can. Exercises "media MIME types are retained, not dropped".
   fetch('/huge.mp4').then(function (r) { return r.arrayBuffer(); }).catch(function () {});
+  // A painted canvas: its pixels exist only at runtime, so the viewer can only
+  // reproduce them from the screencast — which needs the canvas's bounding rect.
+  (function () {
+    var c = document.getElementById('${CANVAS_ID}');
+    var ctx = c.getContext('2d');
+    ctx.fillStyle = '#3366cc';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(10, 10, 20, 20);
+  })();
+  // The dialog is opened by script, so its visibility is runtime state that the
+  // markup alone does not describe.
+  document.getElementById('dialog-open').addEventListener('click', function () {
+    document.getElementById('${DIALOG_ID}').showModal();
+  });
+  document.getElementById('dialog-close').addEventListener('click', function () {
+    document.getElementById('${DIALOG_ID}').close();
+  });
 </script>
 </body></html>`;
 }
