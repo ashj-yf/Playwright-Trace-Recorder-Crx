@@ -218,6 +218,7 @@ test('snapshots carry the markers the viewer needs to restore what was on screen
     const allText = JSON.stringify(frameSnapshots);
     expect(allText).toContain(SCROLLED_INTO_VIEW_TEXT);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

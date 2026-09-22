@@ -128,6 +128,7 @@ test('keeps worker memory bounded while producing a valid trace', async ({ page,
       if (sha1) expect(resourceEntries.has(sha1)).toBe(true);
     }
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

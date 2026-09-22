@@ -1,4 +1,5 @@
 import * as http from 'http';
+import { WebSocketServer } from 'ws';
 
 /**
  * A page that exercises every fidelity branch of the recorder:
@@ -21,8 +22,28 @@ export const PORT = 8153;
 export const BIG_MEDIA_BYTES = 6 * 1024 * 1024;
 export const BIG_IMAGE_BYTES = 5 * 1024 * 1024;
 
+/** A request whose 302 must survive in the trace as its own network entry. */
+export const REDIRECT_FROM = '/redirect-me';
+export const REDIRECT_TO = '/redirected-target';
+
+/** A socket that greets on open and echoes whatever the page sends. */
+export const WS_PATH = '/ws-echo';
+export const WS_GREETING = 'ws-greeting-4f21';
+export const WS_REPLY_PREFIX = 'ws-echo:';
+
 /** A colour only reachable through the external stylesheet. */
 export const TITLE_COLOR = 'rgb(1, 2, 3)';
+
+/**
+ * A port nothing listens on, so a request to it fails at the transport layer.
+ * A refused connection is the one failure shape the browser reports
+ * deterministically and instantly, which is what makes `_failureText`
+ * assertable without waiting on a network timeout.
+ */
+export const DEAD_PORT = 8154;
+
+/** A second checkbox, initially unchecked. */
+export const CHECKBOX_ID = 'check2';
 
 /** Last rule of the big inline stylesheet; present only when CSS is whole. */
 export const INLINE_CSS_SENTINEL = '.inline-tail-sentinel';
@@ -92,7 +113,9 @@ ${burstButtons.join('\n')}
 <input id="check1" type="checkbox" checked>
 <input id="check2" type="checkbox">
 <select id="sel"><option value="a">A</option><option value="b" selected>B</option></select>
+<input id="file-input" type="file" multiple>
 <button id="dbl-target">Double Click Target</button>
+<button id="hover-target">Hover Target</button>
 <div id="ctx-target">Context Menu Target</div>
 <div id="drag-source" style="width:100px;height:100px;position:absolute;left:120px;top:520px;background:#ddeeff;user-select:none">Drag Source</div>
 <div id="drop-zone" style="width:100px;height:100px;position:absolute;left:560px;top:520px;background:#ffeedd">Drop Zone</div>
@@ -145,6 +168,32 @@ ${burstButtons.join('\n')}
   // load via a separate pipeline whose body CDP cannot always return, while a
   // fetch() response can. Exercises "media MIME types are retained, not dropped".
   fetch('/huge.mp4').then(function (r) { return r.arrayBuffer(); }).catch(function () {});
+
+  // Two network shapes the viewer renders but the recorder has to build itself:
+  //  - a redirecting request, whose 302 hop is its own row in the Network tab
+  //    (CDP reuses requestId across the chain, so it must be split explicitly);
+  //  - a WebSocket, whose frames feed the panel's "Messages" tab.
+  // Both are exposed as triggers rather than run at load time, so a test can
+  // fire them only once recording has actually started.
+  window.__triggerRedirect = function () {
+    return fetch('${REDIRECT_FROM}').then(function (r) { return r.json(); });
+  };
+  window.__wsOpen = function () {
+    var socket = new WebSocket('ws://localhost:${PORT}${WS_PATH}');
+    window.__wsFrames = [];
+    window.__wsOpenState = 'connecting';
+    socket.onopen = function () { window.__wsOpenState = 'open'; };
+    socket.onmessage = function (e) { window.__wsFrames.push(e.data); };
+    window.__wsSend = function (text) { socket.send(text); };
+    return true;
+  };
+  // A request that never gets a response: the port is closed, so the connection
+  // is refused and CDP reports loadingFailed with a real transport error. This
+  // is the only deterministic failure the browser produces without a timeout.
+  window.__triggerFailure = function () {
+    return fetch('http://localhost:${DEAD_PORT}/never-answers')
+      .catch(function (e) { return String(e); });
+  };
   // A painted canvas: its pixels exist only at runtime, so the viewer can only
   // reproduce them from the screencast — which needs the canvas's bounding rect.
   (function () {
@@ -200,6 +249,12 @@ export function startServer(): Promise<http.Server> {
       case '/index.html': return send('text/html; charset=utf-8', buildPage());
       case '/spa-route': return send('text/html; charset=utf-8', buildPage());
       case '/frame.html': return send('text/html; charset=utf-8', buildFramePage());
+      // A 302 whose hop must appear in the trace as its own network entry.
+      case REDIRECT_FROM:
+        res.writeHead(302, { Location: REDIRECT_TO, 'Cache-Control': 'no-store' });
+        return res.end();
+      case REDIRECT_TO:
+        return send('application/json', JSON.stringify({ redirected: true }));
       case '/big.css': return send('text/css', css);
       case '/app.js': return send('application/javascript',
         `console.log('app booted');\n${'// filler\n'.repeat(20000)}`);
@@ -210,5 +265,21 @@ export function startServer(): Promise<http.Server> {
         res.writeHead(404); res.end('not found');
     }
   });
+  // A real WebSocket endpoint. The upgrade is handled by ws, so the CDP
+  // Network domain sees a genuine handshake followed by real frames — the only
+  // way to prove frame capture, since a stubbed socket produces none.
+  const wss = new WebSocketServer({ noServer: true });
+  wss.on('connection', socket => {
+    socket.send(WS_GREETING);
+    socket.on('message', data => socket.send(WS_REPLY_PREFIX + data.toString()));
+  });
+  server.on('upgrade', (req, socket, head) => {
+    if ((req.url || '').split('?')[0] !== WS_PATH) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
+  });
+
   return new Promise(resolve => server.listen(PORT, () => resolve(server)));
 }

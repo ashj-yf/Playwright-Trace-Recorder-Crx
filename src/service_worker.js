@@ -46,6 +46,13 @@ const LIMITS = {
   maxScreencastBytes: 128 * 1024 * 1024,
   // Distinct network requests tracked.
   maxTrackedRequests: 3000,
+  // WebSocket frames retained per socket. The Messages tab renders every frame,
+  // so an unbounded socket would grow the record without bound; a frame past
+  // this cap is dropped (and counted), not the socket itself.
+  maxWebSocketFrames: 5000,
+  // A single WebSocket frame larger than this is dropped: text/binary frames
+  // can be megabytes, and each is stored inline in the request record.
+  maxWebSocketFrameBytes: 256 * 1024,
   // Hard ceiling on recorded events.
   maxEvents: 20000,
   // Screencast frames are capped separately: at ~15 fps they would race through
@@ -424,6 +431,11 @@ function createRecording(name, tabId) {
     // Device pixel ratio reported by the page; reconciles the CSS-pixel
     // viewport with device-pixel screencast frames at export time.
     deviceScaleFactor: null,
+    // The page's own locale and time zone, read once from the first frame that
+    // reports them. Exported in the trace's context-options so the archive
+    // records the environment it was captured under.
+    locale: null,
+    timezoneId: null,
 
     // ── Frame registry (multi-frame capture) ──
     // cdpFrameId -> entry:
@@ -449,6 +461,12 @@ function createRecording(name, tabId) {
     cssRequestIds: new Map(),
     resourceNames: new Set(),
 
+    // WebSocket state, keyed by the CDP requestId of the handshake. The handshake
+    // is itself an ordinary Network.requestWillBeSent, and the frames arrive as
+    // separate webSocket* events carrying the same id, so the frames are folded
+    // onto the already-tracked request record.
+    wsByRequestId: new Map(),
+
     // Per-frame last after-snapshot ids: ourFrameId -> snapshot id.
     lastSnapshotIds: {},
 
@@ -473,7 +491,7 @@ function createRecording(name, tabId) {
     dropped: {
       network: 0, oversize: 0, css: 0, snapshots: 0, screenshots: 0,
       events: 0, requests: 0, postData: 0, actionSnapshots: 0, screencast: 0,
-      screencastThrottled: 0
+      screencastThrottled: 0, webSocketFrames: 0
     },
     pendingWrites: new Set(),
     // All request-record mutations serialize through this chain so get/merge/put
@@ -492,6 +510,8 @@ function sessionInfo(rec) {
     url: rec.url,
     viewport: rec.viewport,
     deviceScaleFactor: rec.deviceScaleFactor,
+    locale: rec.locale,
+    timezoneId: rec.timezoneId,
     screencastFrames: rec.screencastFrames,
     cssRefs: [...rec.cssRefs.entries()]
   };
@@ -1154,11 +1174,18 @@ const PAGE_INFO_EXPR = `(function(){
   for (var i = 0; i < links.length; i++) add(links[i].href);
   for (var j = 0; j < document.styleSheets.length; j++) add(document.styleSheets[j].href);
   var dt = document.doctype;
+  // The locale/timezone the page actually ran under. The recorder never emulates
+  // them, so the page's own resolved values ARE the recording's environment —
+  // which is what official records in these same two context-options fields.
+  var tz = '';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
   return JSON.stringify({
     url: window.location.href,
     doctype: dt ? dt.name : 'html',
     viewport: { width: window.innerWidth, height: window.innerHeight },
     deviceScaleFactor: window.devicePixelRatio || 1,
+    locale: navigator.language || '',
+    timezoneId: tz,
     stylesheets: urls
   });
 })()`;
@@ -1651,6 +1678,11 @@ async function captureDomSnapshot(rec, opts = {}) {
       rec.deviceScaleFactor = pageInfo.deviceScaleFactor;
     }
 
+    // Locale and time zone are environment properties shared by every frame, so
+    // the first frame that reports them settles them for the recording.
+    if (pageInfo && pageInfo.locale && !rec.locale) rec.locale = pageInfo.locale;
+    if (pageInfo && pageInfo.timezoneId && !rec.timezoneId) rec.timezoneId = pageInfo.timezoneId;
+
     if (rec.bytes.snapshots >= LIMITS.maxSnapshotBytes) {
       rec.dropped.snapshots++;
       notifyLimit(rec, 'DOM snapshots');
@@ -1924,16 +1956,28 @@ async function recordAction(rec, event, opts) {
     callId,
     startTime: timestamp,
     method: event.type,
-    class: 'Page',
+    // Official names a selector-addressed interaction after the object that owns
+    // it: `Frame.click`, `Frame.fill`, `Frame.hover`, … The trace viewer resolves
+    // an action's title from `class`+`method` against its own API metadata table
+    // (only `Frame.*`/`ElementHandle.*` element actions are listed), so emitting
+    // `Page.click` left every action rendering as the bare method name with no
+    // title and no selector subtitle.
+    class: 'Frame',
     params: {
       selector: event.selector || '',
       ...(event.value != null ? { value: event.value } : {}),
       ...(event.key != null ? { key: event.key } : {}),
+      ...(event.options != null ? { options: event.options } : {}),
+      ...(event.files != null ? { files: event.files } : {}),
       // Optional context the viewer/replayer uses: which element produced a
       // synthetic event (Task 4) and where a click landed (red-dot point).
       ...(event.sourceSelector ? { sourceSelector: event.sourceSelector } : {}),
       ...(Number.isFinite(event.x) && Number.isFinite(event.y)
-        ? { point: { x: Math.round(event.x), y: Math.round(event.y) } } : {})
+        ? { point: { x: Math.round(event.x), y: Math.round(event.y) } } : {}),
+      // The addressed element's rectangle, which the viewer outlines. Captured
+      // in the page at event time: by the time this job runs the element may
+      // have moved or been replaced by the action's own re-render.
+      ...(event.box ? { box: event.box } : {})
     },
     pageId: 'page1',
     timestamp,
@@ -2045,12 +2089,76 @@ function enqueueRequestTask(rec, fn) {
   track(rec, job);
 }
 
-async function handleRequestWillBeSent(rec, sessionId, params) {
+async function handleRequestWillBeSent(rec, sessionId, params, arrivalTs) {
   if (rec.trackedRequestCount >= LIMITS.maxTrackedRequests) {
     rec.dropped.requests++;
     return;
   }
   const rid = (sessionId || '') + '#' + params.requestId;
+
+  // A redirect is not a new request from CDP's point of view: every hop of the
+  // chain shares one requestId, and `redirectResponse` names the previous hop's
+  // finished response. The viewer, however, renders each hop as its own row —
+  // the 3xx with `redirectURL` pointing at its successor. Without a split, the
+  // upsert below would overwrite the 3xx with the final 200 and the redirect
+  // hop would vanish from the panel. So: finalize the previous hop under a
+  // fresh key (pointing its `redirectURL` at this request's URL), then record
+  // this hop under the original key. The redirected-to response stays under
+  // the original key, so `responseReceived`/`loadingFinished` merge onto the
+  // final hop exactly as before.
+  let redirectHops = 0;
+  if (params.redirectResponse) {
+    const prior = await readRequest(rec.session, rid);
+    if (prior && !prior.redirectSplit) {
+      redirectHops = (prior.redirectHops || 0) + 1;
+      // CDP never emits `responseReceived` for a redirect hop: the 3xx arrives as
+      // this event's `redirectResponse`, which is a full `Network.Response` —
+      // timing, remote address and TLS details included. Copying `...prior`
+      // alone therefore leaves the hop with the placeholder protocol and no
+      // timing at all, which is exactly what a HAR consumer sees as "this
+      // request was never measured".
+      const redirectResponse = params.redirectResponse;
+      const redirectTiming = redirectResponse.timing || null;
+      await putRequest(rec.session, rid + '@hop' + (prior.redirectHops || 0), {
+        ...prior,
+        rid: rid + '@hop' + (prior.redirectHops || 0),
+        redirectHops,
+        redirectSplit: true,
+        url: redirectResponse.url || prior.url,
+        status: redirectResponse.status || prior.status,
+        statusText: redirectResponse.statusText || prior.statusText,
+        mimeType: redirectResponse.mimeType || prior.mimeType,
+        responseHeaders: Object.entries(redirectResponse.headers || {})
+          .map(([n, v]) => ({ name: n, value: String(v) })),
+        // The hop's own response metadata, straight off `redirectResponse`.
+        protocol: redirectResponse.protocol || prior.protocol,
+        remoteIPAddress: redirectResponse.remoteIPAddress || prior.remoteIPAddress,
+        remotePort: typeof redirectResponse.remotePort === 'number'
+          ? redirectResponse.remotePort : prior.remotePort,
+        securityDetails: redirectResponse.securityDetails || prior.securityDetails,
+        timing: redirectTiming,
+        // The redirect response has been fully received by the time its
+        // successor's requestWillBeSent fires, so this arrival stamps its end.
+        // The header-arrival anchor cannot be observed directly (this hop never
+        // gets its own `responseReceived`), so it is derived the way official
+        // derives `receive`: `receiveHeadersEnd` is the header arrival measured
+        // in MILLISECONDS from the request's start, so adding it to this hop's
+        // own start places the headers on our wall clock and leaves
+        // `finishedAt - responseReceivedAt` as the header-to-body span.
+        //
+        // Both ends are wall-clock milliseconds, so a hop that completes in
+        // under a millisecond can leave the span negative; the generator falls
+        // back to -1 (an unmeasured phase) rather than publishing a fabricated
+        // positive. That is the honest answer at this clock resolution.
+        responseReceivedAt: redirectTiming && Number.isFinite(redirectTiming.receiveHeadersEnd)
+          ? (prior.timestamp || 0) + redirectTiming.receiveHeadersEnd
+          : (arrivalTs || Date.now()),
+        finishedAt: arrivalTs || Date.now(),
+        redirectURL: params.request?.url || ''
+      });
+      rec.trackedRequestCount++;
+    }
+  }
 
   let postDataText = null;
   let postDataSha1 = null;
@@ -2084,16 +2192,33 @@ async function handleRequestWillBeSent(rec, sessionId, params) {
       .map(([n, v]) => ({ name: n, value: String(v) })),
     postDataText,
     postDataSha1,
+    redirectHops,
+    redirectSplit: false,
     status: 0,
     statusText: '',
     responseHeaders: [],
     mimeType: '',
-    timestamp: Date.now(),
+    resourceType: rec.wsByRequestId.has(rid) ? 'websocket' : '',
+    redirectURL: '',
+    timestamp: arrivalTs || Date.now(),
+    finishedAt: 0,
     encodedLength: 0,
     failed: false,
     errorText: '',
     bodyResource: null,
-    bodySize: 0
+    bodySize: 0,
+    // HTTP-version placeholder until `responseReceived` reports the protocol.
+    // A redirect hop is copied with `...prior`, so a value set on the first hop
+    // would otherwise survive onto the next one; seeding it here keeps every hop
+    // honest if its own response never arrives.
+    protocol: '',
+    // Server address / TLS / timing: all only known once the response headers
+    // arrive (see handleResponseReceived).
+    remoteIPAddress: '',
+    remotePort: -1,
+    securityDetails: null,
+    timing: null,
+    responseReceivedAt: 0
   });
 }
 
@@ -2102,18 +2227,53 @@ async function mergeRequest(rec, rid, patch) {
   await putRequest(rec.session, rid, { ...current, ...patch });
 }
 
-async function handleResponseReceived(rec, sessionId, params) {
+async function handleResponseReceived(rec, sessionId, params, arrivalTs) {
   const rid = (sessionId || '') + '#' + params.requestId;
   const existing = await readRequest(rec.session, rid);
   if (!existing) return;
+  const response = params.response || {};
   const patch = {
-    status: params.response?.status || 0,
-    statusText: params.response?.statusText || '',
-    responseHeaders: Object.entries(params.response?.headers || {})
+    status: response.status || 0,
+    statusText: response.statusText || '',
+    responseHeaders: Object.entries(response.headers || {})
       .map(([n, v]) => ({ name: n, value: String(v) })),
-    mimeType: params.response?.mimeType || ''
+    mimeType: response.mimeType || '',
+    // CDP's own resource classification (document/stylesheet/script/image/xhr/
+    // fetch/font/other). The viewer's network panel uses it to filter by type
+    // and to render websocket rows specially. A websocket handshake must NOT be
+    // reclassified by CDP's PascalCase type (it reports the handshake, not the
+    // socket), so the wsByRequestId marker wins when present.
+    resourceType: rec.wsByRequestId.has(rid) ? 'websocket' : (params.type || 'other'),
+
+    // ── HAR fields the panel and HAR exporters read ──────────────────────────
+    // CDP hands all of these over on `response`; without them the trace reports
+    // a placeholder protocol, an empty server address and no timing breakdown.
+
+    // CDP's wire protocol ("h2", "http/1.1", "blob"). Mapped to the HAR spelling
+    // ("HTTP/2.0") at export, exactly as official does.
+    protocol: response.protocol || '',
+
+    // The resolved server address, surfaced as HAR `serverIPAddress`/`_serverPort`.
+    remoteIPAddress: response.remoteIPAddress || '',
+    remotePort: typeof response.remotePort === 'number' ? response.remotePort : -1,
+
+    // TLS metadata (`{protocol, subjectName, issuer, validFrom, validTo, …}`).
+    // Owned by the response; the panel and HAR consumers read the raw object.
+    securityDetails: response.securityDetails || null,
+
+    // CDP's `Network.ResourceTiming`: each phase in MILLISECONDS relative to
+    // `requestTime`, with -1 for every phase that did not happen (cache hit,
+    // reused connection). The HAR `timings` block is derived from it at export.
+    timing: response.timing || null,
+
+    // When the response HEADERS arrived, on the recorder's wall clock. This is
+    // the only anchor for `timings.receive`, which measures header-arrival to
+    // body-finished and therefore needs a timestamp comparable with
+    // handleLoadingFinished's — CDP's own `timing` is relative to a per-request
+    // origin and must never be mixed with wall-clock readings.
+    responseReceivedAt: arrivalTs || Date.now()
   };
-  if (!existing.url) patch.url = params.response?.url || '';
+  if (!existing.url) patch.url = response.url || '';
   await mergeRequest(rec, rid, patch);
 
   // Remember which request served each stylesheet for CSS fetch fallback.
@@ -2171,7 +2331,11 @@ async function handleLoadingFinished(rec, sessionId, params, timestamp) {
   const existing = await readRequest(rec.session, rid);
   if (!existing) return;
   await mergeRequest(rec, rid, {
-    encodedLength: params.encodedDataLength || existing.encodedLength || 0
+    encodedLength: params.encodedDataLength || existing.encodedLength || 0,
+    // When the response finished. The trace's `time` field is a request
+    // DURATION (the viewer draws start from `_monotonicTime` and width from
+    // `time`), so the duration can only be computed once both ends are known.
+    finishedAt: timestamp || Date.now()
   });
   await captureResponseBody(rec, sessionId, rid);
 }
@@ -2180,13 +2344,162 @@ async function handleLoadingFailed(rec, sessionId, params) {
   const rid = (sessionId || '') + '#' + params.requestId;
   const existing = await readRequest(rec.session, rid);
   if (!existing) return;
+  // A blocked request reports only `blockedReason`; a canceled one only the
+  // flag. Both are still a failure with a human-readable cause.
   const reason = params.errorText ||
     (params.blockedReason ? `blocked:${params.blockedReason}` : 'failed');
   await mergeRequest(rec, rid, {
     failed: true,
+    // The failure cause, exported as HAR `response._failureText`. It is kept
+    // separate from `statusText` on purpose: official leaves statusText EMPTY
+    // for a failed request (the panel derives "canceled"/"ERR" from the status
+    // code, never from this text), so folding the reason into statusText would
+    // display a transport error where the status belongs.
     errorText: params.canceled ? 'canceled' : reason,
-    statusText: params.canceled ? 'canceled' : reason
+    // Official's HAR scaffold starts at status -1 and only a real response
+    // overwrites it, which is what makes the panel render a never-answered
+    // request as "canceled" and flag the row as an error. A request that DID
+    // get a response before failing (404 then aborted) keeps that status.
+    ...(existing.status > 0 ? {} : { status: -1 }),
+    // A failed request still consumed wall time; without this its duration
+    // would be reported as zero and the bar would collapse.
+    finishedAt: Date.now()
   });
+}
+
+/**
+ * A WebSocket never travels as an ordinary requestWillBeSent/responseReceived
+ * pair: CDP emits `webSocketCreated` (the URL), then
+ * `webSocketHandshakeResponseReceived` (the 101), then frames, then close. So
+ * the owning record is minted here and the later events merge onto it.
+ */
+function mintWebSocketRecord(rec, sessionId, rid, url, arrivalTs) {
+  return {
+    rid,
+    frameId: frameIdForNetwork(rec, sessionId, { frameId: null }),
+    url,
+    method: 'GET',
+    requestHeaders: [],
+    postDataText: null,
+    postDataSha1: null,
+    redirectHops: 0,
+    redirectSplit: false,
+    status: 0,
+    statusText: '',
+    responseHeaders: [],
+    mimeType: '',
+    resourceType: 'websocket',
+    redirectURL: '',
+    timestamp: arrivalTs || Date.now(),
+    finishedAt: 0,
+    encodedLength: 0,
+    failed: false,
+    errorText: '',
+    bodyResource: null,
+    bodySize: 0
+  };
+}
+
+/**
+ * `webSocketCreated` is the first event of a socket's life and the only one
+ * that carries its URL. It mints the owning record (a websocket row the panel
+ * routes to the Messages tab) so the handshake response and the frames can
+ * merge onto it; the URL is remembered so a frame that races the mint still
+ * finds its row.
+ */
+async function handleWebSocketCreated(rec, sessionId, params, arrivalTs) {
+  const rid = (sessionId || '') + '#' + params.requestId;
+  const url = params.url || '';
+  rec.wsByRequestId.set(rid, url);
+
+  const existing = await readRequest(rec.session, rid);
+  if (existing) {
+    await mergeRequest(rec, rid, { resourceType: 'websocket' });
+    return;
+  }
+  await putRequest(rec.session, rid, mintWebSocketRecord(rec, sessionId, rid, url, arrivalTs));
+}
+
+/**
+ * The 101 Switching Protocols response. This is the socket's real status; CDP
+ * reports it as `response` on `webSocketHandshakeResponseReceived`, never as an
+ * ordinary responseReceived.
+ */
+async function handleWebSocketHandshake(rec, sessionId, params) {
+  const rid = (sessionId || '') + '#' + params.requestId;
+  const existing = await readRequest(rec.session, rid);
+  if (!existing) return;
+  const response = params.response || {};
+  await mergeRequest(rec, rid, {
+    resourceType: 'websocket',
+    status: response.status || 101,
+    statusText: response.statusText || 'Switching Protocols',
+    responseHeaders: Object.entries(response.headers || {})
+      .map(([n, v]) => ({ name: n, value: String(v) }))
+  });
+}
+
+/**
+ * Fold one WebSocket frame onto its handshake's record. Binary payloads arrive
+ * base64-encoded; text arrives as UTF-8. Both are stored as the viewer expects
+ * them (opcode 1 = text, 2 = binary, …), with a wall-clock offset so the
+ * Messages tab can place each frame on the timeline. A frame is dropped — never
+ * the socket — when the per-socket cap or the per-frame byte cap is hit.
+ */
+async function handleWebSocketFrame(rec, sessionId, params, type, arrivalTs) {
+  const rid = (sessionId || '') + '#' + params.requestId;
+  let existing = await readRequest(rec.session, rid);
+
+  // A frame can race webSocketCreated; mint the row from the remembered URL.
+  if (!existing) {
+    const url = rec.wsByRequestId.get(rid);
+    if (!url) return;
+    await putRequest(rec.session, rid, mintWebSocketRecord(rec, sessionId, rid, url, arrivalTs));
+    existing = await readRequest(rec.session, rid);
+  }
+
+  const frames = existing._webSocketMessages || [];
+  if (frames.length >= LIMITS.maxWebSocketFrames) {
+    rec.dropped.webSocketFrames++;
+    return;
+  }
+
+  // CDP nests the frame under `response` (a WebSocketFrame: {opcode, mask,
+  // payloadData}); the error event instead carries a bare `errorMessage`.
+  const frame = params.response || {};
+  const opcode = typeof frame.opcode === 'number' ? frame.opcode : 1;
+  const data = frame.payloadData != null ? String(frame.payloadData) : '';
+
+  // Guard the inline storage cost: a single giant frame would otherwise blow
+  // past the network budget by sneaking in through the message list.
+  if (data.length > LIMITS.maxWebSocketFrameBytes) {
+    rec.dropped.webSocketFrames++;
+    return;
+  }
+
+  const message = {
+    type: type === 'error' ? 'error' : type,
+    time: arrivalTs || Date.now(),
+    opcode,
+    data
+  };
+  await mergeRequest(rec, rid, { _webSocketMessages: [...frames, message] });
+}
+
+/**
+ * Mark the socket's record as closed so the viewer can render the connection's
+ * terminal state; the close frame itself is an ordinary webSocketFrameReceived
+ * (opcode 8) and is captured there.
+ */
+async function handleWebSocketClosed(rec, sessionId, params, arrivalTs) {
+  const rid = (sessionId || '') + '#' + params.requestId;
+  const existing = await readRequest(rec.session, rid);
+  if (!existing) return;
+  await mergeRequest(rec, rid, {
+    finishedAt: arrivalTs || Date.now(),
+    webSocketClosed: true
+  });
+  rec.wsByRequestId.delete(rid);
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -2267,6 +2580,34 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
 
+  if (method === 'Runtime.exceptionThrown') {
+    // An uncaught page exception. The viewer renders this from
+    // `event`/`method:"pageError"` and counts it toward the action's error
+    // stats, so it must travel as a first-class event rather than as console
+    // text (which the viewer would show as an ordinary log line, if at all).
+    enqueueRequestTask(rec, async () => {
+      if (rec.eventCount >= LIMITS.maxEvents) { rec.dropped.events++; return; }
+      const d = params.exceptionDetails || {};
+      const ex = d.exception || {};
+      await logEvent(rec, {
+        type: 'pageError',
+        error: {
+          name: ex.className || d.type || 'Error',
+          message: ex.description || d.text || 'Uncaught error',
+          stack: (ex.description || '').slice(0, 8192)
+        },
+        location: {
+          url: d.url || '',
+          line: d.lineNumber || 0,
+          column: d.columnNumber || 0
+        },
+        time: timestamp,
+        pageId: 'page1'
+      });
+    });
+    return;
+  }
+
   if (method === 'Log.entryAdded') {
     enqueueRequestTask(rec, async () => {
       if (rec.eventCount >= LIMITS.maxEvents) { rec.dropped.events++; return; }
@@ -2307,12 +2648,12 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   // Only the handful of Network events the trace format actually consumes are
   // retained; every frame/worker session reports into the same stores.
   if (method === 'Network.requestWillBeSent') {
-    enqueueRequestTask(rec, () => handleRequestWillBeSent(rec, sessionId, params));
+    enqueueRequestTask(rec, () => handleRequestWillBeSent(rec, sessionId, params, timestamp));
     return;
   }
 
   if (method === 'Network.responseReceived') {
-    enqueueRequestTask(rec, () => handleResponseReceived(rec, sessionId, params));
+    enqueueRequestTask(rec, () => handleResponseReceived(rec, sessionId, params, timestamp));
     return;
   }
 
@@ -2323,6 +2664,40 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   if (method === 'Network.loadingFailed') {
     enqueueRequestTask(rec, () => handleLoadingFailed(rec, sessionId, params));
+    return;
+  }
+
+  // WebSocket frames. The handshake itself arrives as an ordinary
+  // Network.requestWillBeSent whose response carries status 101, but the frames
+  // are separate webSocket* events reusing the handshake's requestId. They fold
+  // onto that already-tracked record as `_webSocketMessages`.
+  if (method === 'Network.webSocketCreated') {
+    enqueueRequestTask(rec, () => handleWebSocketCreated(rec, sessionId, params, timestamp));
+    return;
+  }
+
+  if (method === 'Network.webSocketHandshakeResponseReceived') {
+    enqueueRequestTask(rec, () => handleWebSocketHandshake(rec, sessionId, params));
+    return;
+  }
+
+  if (method === 'Network.webSocketFrameSent') {
+    enqueueRequestTask(rec, () => handleWebSocketFrame(rec, sessionId, params, 'send', timestamp));
+    return;
+  }
+
+  if (method === 'Network.webSocketFrameReceived') {
+    enqueueRequestTask(rec, () => handleWebSocketFrame(rec, sessionId, params, 'receive', timestamp));
+    return;
+  }
+
+  if (method === 'Network.webSocketFrameError') {
+    enqueueRequestTask(rec, () => handleWebSocketFrame(rec, sessionId, params, 'error', timestamp));
+    return;
+  }
+
+  if (method === 'Network.webSocketClosed') {
+    enqueueRequestTask(rec, () => handleWebSocketClosed(rec, sessionId, params, timestamp));
   }
 });
 

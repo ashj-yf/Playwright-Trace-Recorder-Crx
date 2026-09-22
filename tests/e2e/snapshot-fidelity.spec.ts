@@ -151,6 +151,7 @@ test('captures whole stylesheets, frames, shadow DOM, forms and references', asy
     expect(rawMain.some(json => json.includes('"X-SCRIPT"'))).toBe(true);
     expect(mainRendered.some(r => r.html.includes(INLINE_SCRIPT_SENTINEL))).toBe(true);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

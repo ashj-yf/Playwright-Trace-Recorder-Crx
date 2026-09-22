@@ -98,6 +98,7 @@ test('absolutizes resource URLs so the viewer can serve them', async ({ page, co
     expect(oracle.resourceByUrl(mainIdx, 'http://localhost:8153/small.png')).toBeTruthy();
     expect(listEntries(zipPath)).toContain('resources/' + cssRes.response.content._sha1);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

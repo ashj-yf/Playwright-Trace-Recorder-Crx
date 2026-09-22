@@ -11,9 +11,14 @@ import {
  * one dblclick action (its second click strike swallowed), a right click as a
  * contextmenu action, and a drag as one dragTo carrying the source element and
  * the drop point instead of the raw click trail. Toggling a checkbox must
- * collapse the click+input+change burst into the single click action — the
- * checked state already rides on the DOM snapshot's __playwright_checked_
- * marker — and that click still pins its red-dot point for the viewer.
+ * produce a single canonical `check`/`uncheck` action — not a click — whose
+ * state rides the DOM snapshot's __playwright_checked_ marker, and that action
+ * still pins its red-dot point for the viewer.
+ *
+ * The action's `class` is part of the contract, not decoration: the viewer
+ * resolves an action's title from `class`+`method` against its own API metadata
+ * table, which lists element actions under `Frame.*` only. A `Page.click` line
+ * renders as the bare word "click" with no selector subtitle.
  */
 test('records dblclick, contextmenu and dragTo, merges checkbox triple events', async ({ page, context, extensionId }) => {
   test.setTimeout(180_000);
@@ -78,6 +83,23 @@ await page.click('#check2');
     expect(methods).toContain('dragTo');
     expect(befores.filter(b => b.method === 'dragTo')).toHaveLength(1);   // selection drag adds none
 
+    // The viewer titles an action only when `class`+`method` resolve against its
+    // API metadata table, which keys element actions as `Frame.*`. A `Page.*`
+    // line falls back to the raw method name ("click") with no selector
+    // subtitle, so the class is asserted rather than assumed.
+    for (const b of befores) {
+      expect(
+        b.class,
+        `${b.method} carries class "${b.class}": the viewer resolves action titles ` +
+        `from Frame.<method>, so any other class renders as the bare method name`
+      ).toBe('Frame');
+      expect(
+        b.apiName,
+        'apiName is copied verbatim into `title` by the viewer modernizer, which then ' +
+        'overrides the metadata table and defeats the title/subtitle lookup'
+      ).toBeUndefined();
+    }
+
     const dbl = befores.find(b => b.method === 'dblclick');
     // The double click's second strike is swallowed; only the first survives.
     expect(befores.filter(b => b.method === 'click' && b.params.selector === dbl!.params.selector))
@@ -87,14 +109,29 @@ await page.click('#check2');
     expect(drag!.params.sourceSelector).toBeTruthy();
     expect(drag!.params.point).toEqual({ x: expect.any(Number), y: expect.any(Number) });
 
-    // Checkbox: one click action, no input/change stragglers behind it.
-    expect(befores.filter(b => b.params.selector === '#check2')).toHaveLength(1);
+    // Checkbox: one toggle action, no click/input/change stragglers behind it.
+    // The click handler emits the canonical check/uncheck and the input+change
+    // pair that follows is ignored, so the toggle never appears twice.
+    expect(
+      befores.filter(b => b.params.selector === '#check2'),
+      'a checkbox toggle must surface once, as its own check/uncheck action'
+    ).toHaveLength(1);
     expect(befores.some(b => b.method === 'input' && b.params.selector === '#check2')).toBe(false);
+    expect(befores.some(b => b.method === 'change' && b.params.selector === '#check2')).toBe(false);
 
-    const click = befores.find(b => b.method === 'click' && b.params.selector === '#check2');
-    const inputLine = lines.find(l => l.type === 'input' && l.callId === click!.callId);
+    const toggle = befores.find(b => b.params.selector === '#check2');
+    expect(
+      toggle!.method,
+      'an unchecked box being toggled on is a `check`, which the viewer titles "Check"'
+    ).toBe('check');
+    const inputLine = lines.find(l => l.type === 'input' && l.callId === toggle!.callId);
     expect(inputLine!.point).toBeTruthy();  // viewer red circle
   } finally {
+    // `server.close()` waits for every open connection to end, and Chromium
+    // holds keep-alive sockets to this origin until its context is torn down —
+    // which happens only after this block returns. Dropping them explicitly is
+    // what keeps the teardown from outliving the test's timeout.
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

@@ -67,6 +67,7 @@ test('burst actions always carry after snapshots and never dangle input lines', 
     // Synthetic element.click() carries clientX/clientY = 0.
     for (const inp of inputs) expect(inp.point).toEqual({ x: 0, y: 0 });
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

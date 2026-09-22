@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Playwright Trace Recorder",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "description": "Record browser interactions as Playwright traces. Saved locally, no backend needed. Download and replay at trace.playwright.dev.",
   "permissions": [
     "storage",

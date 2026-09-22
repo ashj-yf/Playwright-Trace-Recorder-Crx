@@ -35,6 +35,14 @@ const lines = read('trace.trace').toString().split('\n').filter(Boolean).map(l =
 const snapshots = lines.filter(l => l.type === 'frame-snapshot');
 const kb = n => (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
 
+// trace.network is optional: a recording that captured no requests still yields a
+// valid archive, so every check below degrades rather than throwing.
+let netLines = [];
+if (entries.includes('trace.network')) {
+  netLines = read('trace.network').toString().split('\n').filter(Boolean)
+    .map(l => JSON.parse(l)).filter(l => l.type === 'resource-snapshot');
+}
+
 console.log(`\n${zipPath}`);
 console.log(`archive ${kb(fs.statSync(zipPath).size)} · ${entries.length} entries · ` +
   `${snapshots.length} snapshots\n`);
@@ -409,6 +417,291 @@ if (shotDims.length) {
   }
 } else {
   console.log('  (no screencast resources to measure)');
+}
+
+// ── Viewer contract: snapshot declaration order and phase ─────────────────────
+// Playwright's trace modernizer derives each frame-snapshot's `phase` from the
+// action event that NAMES it: `_modernize_8_to_9` runs
+// `snapshot.phase = _snapshotPhases.get(snapshot.snapshotName)`, and that map is
+// only populated while the declaring event is being processed. So the declaring
+// line must be emitted BEFORE the snapshot line it references. Emit the snapshot
+// first and the lookup misses, `phase` becomes undefined, SnapshotStorage never
+// registers a renderer, and every action renders a blank frame.
+//
+// This is invisible to the older viewer (up to v8), which resolves snapshots by
+// `snapshotName` instead — hence a trace can look fine locally and be broken on
+// trace.playwright.dev.
+
+const REF_FIELDS = [
+  ['beforeSnapshot', 'before'],
+  ['inputSnapshot', 'action'],
+  ['afterSnapshot', 'after'],
+];
+
+const snapshotNames = new Set();
+const snapshotIndexByName = new Map();
+for (let i = 0; i < lines.length; i++) {
+  const l = lines[i];
+  if (l.type !== 'frame-snapshot') continue;
+  const name = l.snapshot.snapshotName;
+  if (!name) continue;
+  if (!snapshotIndexByName.has(name)) snapshotIndexByName.set(name, i);
+  snapshotNames.add(name);
+}
+
+const declarations = [];       // { name, phase, line, declaredAt }
+const danglingRefs = [];       // declared but never emitted
+const outOfOrderRefs = [];     // emitted before its declaring line
+for (let i = 0; i < lines.length; i++) {
+  const l = lines[i];
+  for (const [field, phase] of REF_FIELDS) {
+    const name = l[field];
+    if (!name) continue;
+    declarations.push({ name, phase, declaredAt: i });
+    if (!snapshotNames.has(name)) {
+      danglingRefs.push({ name, phase, declaredAt: i });
+    } else if (snapshotIndexByName.get(name) < i) {
+      outOfOrderRefs.push({ name, phase, declaredAt: i, emittedAt: snapshotIndexByName.get(name) });
+    }
+  }
+}
+
+console.log('\nVIEWER CONTRACT (snapshot phase + declaration order)');
+console.log(`  frame-snapshot lines           ${snapshots.length}`);
+console.log(`  snapshot name declarations     ${declarations.length}`);
+console.log(`  emitted before declaration     ${outOfOrderRefs.length}`);
+console.log(`  declared but never emitted     ${danglingRefs.length}`);
+
+if (outOfOrderRefs.length) {
+  console.log('  ❌ a snapshot is emitted before the action event that names it —');
+  console.log('     the modernizer\'s snapshotName→phase map is still empty at that point,');
+  console.log('     so `phase` is assigned undefined and the viewer registers no renderer');
+  console.log(`     (${outOfOrderRefs.length} reference(s), e.g. ${outOfOrderRefs[0].name})`);
+  fail(`${outOfOrderRefs.length} snapshot(s) emitted before their declaring event: ` +
+    'phase is lost and no renderer is registered (blank frames in viewer >= 1.63)');
+} else if (declarations.length) {
+  console.log('  ✅ every declaring event precedes the snapshot it references');
+}
+
+if (danglingRefs.length) {
+  console.log(`  ❌ ${danglingRefs.length} dangling snapshot reference(s) — the viewer asks for a`);
+  console.log('     snapshot that does not exist and falls back to a blank frame');
+  for (const d of danglingRefs.slice(0, 3)) console.log(`     ${d.phase}: ${d.name}`);
+  fail(`${danglingRefs.length} dangling snapshot reference(s): ` +
+    danglingRefs.slice(0, 3).map(d => d.name).join(', '));
+} else if (declarations.length) {
+  console.log('  ✅ no dangling snapshot references');
+}
+
+// ── Viewer contract: console channel ──────────────────────────────────────────
+// The viewer reads console output from a top-level `type: "console"` line with a
+// `messageType`. Official 1.5-era traces carried console text as
+// `type:"event", class:"Page", method:"console"`; that shape is NOT rendered by
+// the current viewer, so those messages are silently lost from the Console panel.
+
+const nativeConsole = lines.filter(l => l.type === 'console');
+const legacyConsole = lines.filter(l =>
+  l.type === 'event' && l.class === 'Page' && l.method === 'console');
+
+console.log('\nVIEWER CONTRACT (console channel)');
+console.log(`  native console lines           ${nativeConsole.length}`);
+console.log(`  legacy Page.console events     ${legacyConsole.length}`);
+
+if (legacyConsole.length) {
+  console.log('  ❌ console output uses the legacy Page.console event shape —');
+  console.log('     the viewer renders only top-level type:"console" lines, so these');
+  console.log('     messages never appear in the Console panel');
+  fail(`${legacyConsole.length} console message(s) use the legacy Page.console shape ` +
+    'the viewer does not render');
+} else if (nativeConsole.length) {
+  const missingType = nativeConsole.filter(l => !l.messageType).length;
+  if (missingType) {
+    console.log(`  ❌ ${missingType} console line(s) without messageType`);
+    fail(`${missingType} native console line(s) lack messageType`);
+  } else {
+    console.log('  ✅ native console channel with messageType');
+  }
+} else {
+  console.log('  (no console output captured)');
+}
+
+// ── Viewer contract: network semantics ────────────────────────────────────────
+// The viewer draws a request bar as
+//   start    = _monotonicTime - (minimum across resources)
+//   duration = time
+// so `time` is a DURATION and `_monotonicTime` is the request's start offset.
+// Writing the start offset into `time` makes every bar span from its own start to
+// the same absolute point, pushing the waterfall far past the recording's end.
+
+console.log('\nVIEWER CONTRACT (network timing + fields)');
+
+if (!netLines.length) {
+  console.log('  (no resource-snapshot lines found)');
+} else {
+  const sameAsStart = netLines.filter(l => l.snapshot.time === l.snapshot._monotonicTime);
+  const notNumber = netLines.filter(l => typeof l.snapshot.time !== 'number');
+  const negative = netLines.filter(l => typeof l.snapshot.time === 'number' && l.snapshot.time < 0);
+
+  console.log(`  resource-snapshot lines        ${netLines.length}`);
+  console.log(`  time === _monotonicTime        ${sameAsStart.length}`);
+
+  if (notNumber.length) {
+    console.log(`  ❌ ${notNumber.length} request(s) have a non-numeric time`);
+    fail(`${notNumber.length} resource-snapshot line(s) have a non-numeric time`);
+  } else if (negative.length) {
+    console.log(`  ❌ ${negative.length} request(s) have a negative duration`);
+    fail(`${negative.length} resource-snapshot line(s) have a negative time`);
+  } else if (sameAsStart.length === netLines.length && netLines.length > 1) {
+    console.log('  ❌ `time` equals `_monotonicTime` on every request — the start offset is');
+    console.log('     being written where the viewer expects the request DURATION, so the');
+    console.log('     waterfall draws every bar to the same absolute point');
+    fail('network `time` duplicates `_monotonicTime`: viewer treats it as duration, ' +
+      'so request bars extend past the recording end');
+  } else {
+    // The waterfall must stay inside the recording. Compare the furthest bar end
+    // against the span the trace actually covers.
+    const ends = netLines.map(l => (l.snapshot._monotonicTime || 0) + (l.snapshot.time || 0));
+    const maxEnd = Math.max(...ends);
+    const traceEnd = Math.max(
+      ...lines.filter(l => typeof l.time === 'number').map(l => l.time),
+      ...afters.map(a => a.endTime).filter(t => typeof t === 'number'),
+      0);
+    console.log(`  furthest bar end               ${Math.round(maxEnd)} ms`);
+    console.log(`  recording span                 ${Math.round(traceEnd)} ms`);
+    if (traceEnd > 0 && maxEnd > traceEnd * 1.5) {
+      console.log(`  ❌ a request bar ends ${Math.round(maxEnd - traceEnd)} ms past the recording —`);
+      console.log('     `time` is a start offset, not a duration');
+      fail(`network waterfall overruns the recording by ${Math.round(maxEnd - traceEnd)} ms: ` +
+        '`time` is being written as a start offset instead of a duration');
+    } else {
+      console.log('  ✅ request bar durations stay within the recording');
+    }
+  }
+
+  // Field-level contract: the network list shows a size and offers a resource-type
+  // filter; both read fields the official recorder always writes.
+  const missingType = netLines.filter(l => !l.snapshot._resourceType);
+  const noSize = netLines.filter(l => {
+    const r = l.snapshot.response || {};
+    const shown = r._transferSize > 0 ? r._transferSize : r.bodySize;
+    return typeof shown !== 'number';
+  });
+
+  console.log(`  with _resourceType             ${netLines.length - missingType.length}/${netLines.length}`);
+  console.log(`  with a displayable size        ${netLines.length - noSize.length}/${netLines.length}`);
+
+  if (missingType.length) {
+    console.log(`  ❌ ${missingType.length} request(s) lack _resourceType — the network`);
+    console.log('     panel\'s resource-type filter cannot classify them');
+    fail(`${missingType.length} resource-snapshot line(s) lack _resourceType`);
+  } else {
+    console.log('  ✅ resource type present');
+  }
+
+  if (noSize.length) {
+    console.log(`  ❌ ${noSize.length} request(s) have no displayable size — the network`);
+    console.log('     list shows "undefined" instead of the transfer size');
+    fail(`${noSize.length} resource-snapshot line(s) expose no _transferSize/bodySize`);
+  } else {
+    console.log('  ✅ transfer size present');
+  }
+}
+
+// ── Viewer contract: action target box ────────────────────────────────────────
+// The viewer draws a translucent highlight over the element an action addressed
+// (`setScreencastAnnotation` reads `box`). It is only used for the `action`
+// phase, so a trace without it shows the click point but no element outline.
+//
+// Only pointer actions are expected to carry one: a keyboard action has no
+// element rectangle, and official traces leave `box` absent for those too. So
+// the check is scoped to the input lines of pointer actions rather than to every
+// input line, which would raise false alarms on keyboard-driven traces.
+
+const POINTER_METHODS = new Set(['click', 'dblclick', 'contextmenu', 'dragTo']);
+const pointerCallIds = new Set(
+  beforeActions.filter(l => POINTER_METHODS.has(l.method)).map(l => l.callId));
+
+const inputLines = lines.filter(l => l.type === 'input');
+const pointerInputs = inputLines.filter(l => pointerCallIds.has(l.callId));
+const pointerBoxes = pointerInputs.filter(l => l.box && typeof l.box.width === 'number').length;
+const keyboardInputs = inputLines.length - pointerInputs.length;
+
+console.log('\nVIEWER CONTRACT (action target box)');
+console.log(`  input lines                    ${inputLines.length}`);
+console.log(`  of pointer actions             ${pointerInputs.length} (${keyboardInputs} other)`);
+console.log(`  pointer inputs with a box      ${pointerBoxes}`);
+
+if (pointerInputs.length && pointerBoxes === 0) {
+  console.log('  ❌ no pointer action carries a box — the viewer draws the click point');
+  console.log('     but never outlines the element the action addressed');
+  fail(`${pointerInputs.length} pointer action(s) carry no box: ` +
+    'the viewer shows no element highlight for them');
+} else if (pointerInputs.length) {
+  console.log(`  ✅ ${pointerBoxes}/${pointerInputs.length} pointer action(s) carry a box`);
+  if (pointerBoxes < pointerInputs.length) {
+    warn(`${pointerInputs.length - pointerBoxes} pointer action(s) without a box: ` +
+      'no element highlight for those');
+  }
+}
+
+// ── Viewer contract: action titles ────────────────────────────────────────────
+// The viewer titles an action as
+//   `title ?? actionMetadata[class + "." + method]?.title ?? method`
+// and its metadata table keys element actions as `Frame.*` / `ElementHandle.*`
+// only. Two independent ways to lose the title (both observed in this project's
+// output before the fix):
+//   - a `Page.*` class has no metadata entry, so the row renders as the bare
+//     method name ("click") with no selector subtitle, and
+//   - `apiName` is copied verbatim into `title` by the v6 -> v8 modernizer,
+//     which then SHORT-CIRCUITS the metadata lookup and renders the raw API
+//     string (e.g. "Page.click") instead of a human title.
+// A gesture that the viewer has a dedicated title for (Hover, Check, Select
+// option, Set input files) is only actually labelled if its method survives.
+
+const ACTION_TITLES = {
+  click: 'Click', dblclick: 'Double click', fill: 'Fill', press: 'Press',
+  hover: 'Hover', check: 'Check', uncheck: 'Uncheck',
+  selectOption: 'Select option', setInputFiles: 'Set input files',
+  dragAndDrop: 'Drag and drop', goto: 'Navigate', screenshot: 'Screenshot',
+  setContent: 'Set content', tap: 'Tap'
+};
+
+console.log('\nVIEWER CONTRACT (action titles)');
+if (!beforeActions.length) {
+  console.log('  (no actions recorded)');
+} else {
+  const badClass = beforeActions.filter(l => l.class !== 'Frame');
+  const withApiName = beforeActions.filter(l => l.apiName);
+  const untitled = beforeActions.filter(l => !(l.method in ACTION_TITLES));
+  const titled = beforeActions.length - untitled.length;
+
+  console.log(`  actions                        ${beforeActions.length}`);
+  console.log(`  with a viewer title            ${titled}`);
+  if (untitled.length) {
+    const names = [...new Set(untitled.map(l => l.method))].join(', ');
+    console.log(`  without a metadata title       ${untitled.length} (${names})`);
+  }
+
+  if (badClass.length) {
+    console.log(`  ❌ ${badClass.length} action(s) use class "${badClass[0].class}" — the viewer's`);
+    console.log('     metadata table lists element actions as Frame.*, so these render');
+    console.log('     as the bare method name with no selector subtitle');
+    fail(`${badClass.length} action(s) carry class "${badClass[0].class}" instead of "Frame": ` +
+      'the viewer cannot resolve a title for them');
+  } else {
+    console.log('  ✅ every action uses the Frame class');
+  }
+
+  if (withApiName.length) {
+    console.log(`  ❌ ${withApiName.length} action(s) carry apiName — the modernizer turns it`);
+    console.log('     into `title`, which overrides the metadata table entirely');
+    fail(`${withApiName.length} action(s) carry apiName, which overrides the viewer title lookup`);
+  }
+
+  if (untitled.length) {
+    warn(`${untitled.length} action(s) have no viewer title: ` +
+      [...new Set(untitled.map(l => l.method))].join(', '));
+  }
 }
 
 // ── Where the archive weight actually is ──────────────────────────────────────

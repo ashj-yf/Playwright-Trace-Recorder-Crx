@@ -85,6 +85,7 @@ test('coalesces a typing burst into one fill action', async ({ page, context, ex
       [`action@${secondFillCallId}`, `after@${secondFillCallId}`].includes(r.name));
     expect(finalStages.some(r => r.html.includes('second burst'))).toBe(true);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

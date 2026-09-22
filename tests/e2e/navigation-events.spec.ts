@@ -56,6 +56,7 @@ test('records SPA pushState and full-page navigations as Frame.navigated', async
     expect(JSON.parse(readEntry(zipPath, 'metadata.json').toString()).pages[0].url)
       .toContain('/frame.html');                                      // rec.url 最终 URL（行为变更：原为首 URL）
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

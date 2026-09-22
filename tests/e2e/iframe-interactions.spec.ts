@@ -44,6 +44,7 @@ test('records a click inside an iframe', async ({ page, context, extensionId }) 
 
     expect(befores.some(b => b.method === 'click' && b.params.selector === '#frame-btn')).toBe(true);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });

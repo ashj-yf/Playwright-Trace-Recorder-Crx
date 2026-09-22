@@ -184,6 +184,103 @@ function neutralizeScripts(node, snapshotName) {
 }
 
 /**
+ * CDP wire protocol -> HAR `httpVersion` spelling.
+ *
+ * Mirrors playwright-core's `Response.internalHttpVersion()` exactly: absent or
+ * `http/1.1` reads back as `HTTP/1.1`, `h2` as `HTTP/2.0`, and anything else
+ * (including `blob`) is passed through unchanged. Emitting CDP's own spelling
+ * would show "h2" where every official trace and the official HAR exporter
+ * show "HTTP/2.0".
+ */
+function harHttpVersion(protocol) {
+  if (!protocol) return 'HTTP/1.1';
+  if (protocol === 'http/1.1') return 'HTTP/1.1';
+  if (protocol === 'h2') return 'HTTP/2.0';
+  return protocol;
+}
+
+/**
+ * Builds the HAR `timings` block from CDP's `Network.ResourceTiming`.
+ *
+ * Every phase is a difference of two fields that share one clock (`requestTime`),
+ * so the subtraction is directly in milliseconds — this is the same arithmetic
+ * playwright-core performs in `_onResponseReceived`/`_onRequestFinished`. `-1`
+ * means "this phase did not happen" (cache hit, reused connection) and is
+ * preserved rather than zeroed, because zero would claim an instantaneous phase
+ * instead of an absent one.
+ *
+ * `send` is pinned to 0 exactly as official does. `receive` measures response
+ * headers to end of body: CDP's `timing` has no end field for it, so it comes
+ * from the recorder's own arrival timestamps.
+ *
+ * @param {Object} req Stored request record.
+ * @returns {{dns: number, connect: number, ssl: number, send: number,
+ *   wait: number, receive: number}|{send: number, wait: number, receive: number}}
+ */
+function harTimings(req) {
+  // No CDP timing at all (a cache hit, a service-worker-served response, or a
+  // request whose response never arrived): the honest answer is the same
+  // all-placeholder block the official HAR scaffold starts from.
+  const t = req.timing;
+  if (!t) return { send: -1, wait: -1, receive: -1 };
+
+  const phase = (end, start) =>
+    Number.isFinite(end) && Number.isFinite(start) && end !== -1 && start !== -1
+      ? roundish(end - start)
+      : -1;
+
+  // Response headers -> end of body. The recorder samples both ends on its own
+  // wall clock; a request that never finished keeps -1 rather than inventing
+  // the remainder of the total.
+  const receive = req.responseReceivedAt && req.finishedAt && req.finishedAt >= req.responseReceivedAt
+    ? roundish(req.finishedAt - req.responseReceivedAt)
+    : -1;
+
+  return {
+    dns: phase(t.dnsEnd, t.dnsStart),
+    connect: phase(t.connectEnd, t.connectStart),
+    ssl: phase(t.connectEnd, t.sslStart),
+    // Official pins send to 0 (not -1): the phase is considered measured.
+    send: 0,
+    wait: phase(t.receiveHeadersEnd, t.sendStart),
+    receive
+  };
+}
+
+/**
+ * Normalizes CDP's `securityDetails` to the shape official's HAR carries.
+ *
+ * playwright-core builds this object field-by-field (`_securityDetailsFinished`)
+ * with exactly `protocol`, `subjectName`, `issuer`, `validFrom` and `validTo`;
+ * CDP's own payload additionally holds fields such as
+ * `certificateTransparencyCompliance`, `sanList` and `signedCertificateTimestampList`.
+ * Publishing the raw object would put keys in the archive that no HAR consumer
+ * expects, so only the official five are kept. Absent fields are omitted (which
+ * is how official's `undefined` values serialize), leaving `{}` for a plain
+ * HTTP response — exactly what official writes there.
+ *
+ * @param {Object} details CDP `Network.SecurityDetails`.
+ * @returns {Object} The five-field HAR object.
+ */
+function harSecurityDetails(details) {
+  const out = {};
+  for (const key of ['protocol', 'subjectName', 'issuer', 'validFrom', 'validTo']) {
+    if (details[key] !== undefined && details[key] !== null) out[key] = details[key];
+  }
+  return out;
+}
+
+/**
+ * Truncates to microsecond precision, matching playwright-core's
+ * `millisToRoundishMillis` (`(value * 1e3 | 0) / 1e3`). Without it, floating
+ * point noise from the CDP differences shows up as absurd fractional
+ * milliseconds in the HAR.
+ */
+function roundish(ms) {
+  return Math.trunc(ms * 1e3) / 1e3;
+}
+
+/**
  * Emits a Playwright trace zip for a finished (or recovered) recording.
  *
  * @param {Object} recording Recorder state; everything bulky is read from IDB.
@@ -222,7 +319,13 @@ async function generatePlaywrightTraceInBrowser(recording) {
     endTime: relTime(nowWall),
     wallTime: baseTime,
     browserName: 'chromium',
-    options: { viewport, deviceScaleFactor: scaleFactor, isMobile: false },
+    options: {
+      viewport,
+      deviceScaleFactor: scaleFactor,
+      isMobile: false,
+      ...(recording.locale ? { locale: recording.locale } : {}),
+      ...(recording.timezoneId ? { timezoneId: recording.timezoneId } : {})
+    },
     pages: [{
       pageId,
       url: recording.url || '',
@@ -327,7 +430,13 @@ async function generatePlaywrightTraceInBrowser(recording) {
         deviceScaleFactor: scaleFactor,
         isMobile: false,
         hasTouch: false,
-        javaScriptEnabled: true
+        javaScriptEnabled: true,
+        // The environment the page actually ran under. Official records both;
+        // they are read from the page at capture time and omitted when unknown,
+        // rather than guessed, so a trace never claims an environment it did not
+        // observe.
+        ...(recording.locale ? { locale: recording.locale } : {}),
+        ...(recording.timezoneId ? { timezoneId: recording.timezoneId } : {})
       },
       platform: navigator.platform || 'unknown',
       wallTime: baseTime,
@@ -399,36 +508,53 @@ async function generatePlaywrightTraceInBrowser(recording) {
         const beforeName = `before@${actionId}`;
         const actionName = `action@${actionId}`;
 
+        // The declaring line MUST be emitted before the snapshot it names.
+        // Playwright's modernizer (`_modernize_8_to_9`) resolves each
+        // frame-snapshot's `phase` by looking the snapshot up in a map that is
+        // only populated while the declaring event is processed; a snapshot
+        // written first gets `phase = undefined`, registers no renderer, and
+        // renders blank. Building still happens here (the subtree referencer is
+        // stateful and counts snapshots in emission order), only the yield moves.
         const beforeLines = await buildFrameLines(
           beforeName, event.beforeSnapshotIds, actionId, relTime(eventTime));
-        for (const line of beforeLines) yield line;
 
         yield JSON.stringify({
           type: 'before',
           callId: actionId,
           startTime: relTime(eventTime),
-          apiName: `${event.class || 'Page'}.${event.method || 'click'}`,
-          class: event.class || 'Page',
+          // No `apiName`: the v6→v8 modernizer copies it verbatim into `title`,
+          // which then WINS over the viewer's own metadata lookup and renders the
+          // raw string (e.g. "Frame.click") instead of a human title. Official
+          // traces carry `class`+`method` only and let the viewer resolve
+          // "Click" / "Fill "{value}"" with the selector as subtitle.
+          class: event.class || 'Frame',
           method: event.method || 'click',
           params: event.params || {},
           pageId,
           wallTime: eventTime,
-          beforeSnapshot: beforeName,
+          // Only declare a before snapshot that actually exists: a dangling
+          // reference makes the viewer ask for a snapshot it can never find.
+          beforeSnapshot: beforeLines.length > 0 ? beforeName : undefined,
           internal: {}
         }) + '\n';
 
+        for (const line of beforeLines) yield line;
+
         const actionLines = await buildFrameLines(
           actionName, event.actionSnapshotIds, actionId, relTime(eventTime));
-        for (const line of actionLines) yield line;
 
         // A gated action snapshot must not leave a dangling inputSnapshot
         // reference behind: emit the input line only when the action stage
-        // exists. point rides along so the viewer can pin the click position.
+        // exists. point rides along so the viewer can pin the click position,
+        // and box lets it outline the element the action addressed.
         if (actionLines.length > 0) {
           yield JSON.stringify({
             type: 'input', callId: actionId, inputSnapshot: actionName,
-            ...(event.params && event.params.point ? { point: event.params.point } : {})
+            ...(event.params && event.params.point ? { point: event.params.point } : {}),
+            ...(event.params && event.params.box ? { box: event.params.box } : {})
           }) + '\n';
+
+          for (const line of actionLines) yield line;
         }
 
         pendingActions.set(actionId, {
@@ -444,7 +570,6 @@ async function generatePlaywrightTraceInBrowser(recording) {
         const afterName = `after@${actionId}`;
         const afterLines = await buildFrameLines(
           afterName, event.afterSnapshotIds, actionId, snapTime);
-        for (const line of afterLines) yield line;
 
         const hasDomSnapshots =
           (pending && pending.hasDom) || afterLines.length > 0;
@@ -458,6 +583,15 @@ async function generatePlaywrightTraceInBrowser(recording) {
           internal: {}
         };
 
+        // Synthetic frames are BUILT here (the subtree referencer is stateful and
+        // counts in emission order) but yielded after the declaring `after` line,
+        // for the same reason as the before/action stages above.
+        //
+        // Only the `after` stage is synthesized. This branch runs when the action
+        // produced no DOM snapshot at all, so there is no before/action state to
+        // represent; emitting three copies of the same embedded screenshot would
+        // multiply the payload for frames no renderer can ever reach.
+        const fallbackLines = [];
         const attachments = [];
         for (const att of (event.attachments || [])) {
           if (!att.resource) continue;
@@ -486,34 +620,32 @@ async function generatePlaywrightTraceInBrowser(recording) {
                 url: recording.url || '',
                 viewport
               };
-              for (const name of [`before@${actionId}`, `action@${actionId}`, `after@${actionId}`]) {
-                // The synthetic DOM is built here rather than read from IDB: no
-                // DOM snapshot exists at all for this action.
-                const html = referencerFor(mainFrameId)(
-                  neutralizeScripts(fallbackDom.html, name));
-                yield JSON.stringify({
-                  type: 'frame-snapshot',
-                  snapshot: {
-                    callId: actionId,
-                    snapshotName: name,
-                    pageId,
-                    frameId: mainFrameId,
-                    frameUrl: recording.url || '',
-                    doctype: 'html',
-                    html,
-                    viewport,
-                    timestamp: snapTime,
-                    // No page-stamped capture instant exists for a synthetic
-                    // frame; the action's absolute end time is the closest
-                    // truthful wall clock, and keeps pairing working.
-                    wallTime: event.endTime || eventTime,
-                    collectionTime: 0,
-                    resourceOverrides,
-                    isMainFrame: true
-                  }
-                }) + '\n';
-              }
-              afterEvent.afterSnapshot = `after@${actionId}`;
+              // The synthetic DOM is built here rather than read from IDB: no
+              // DOM snapshot exists at all for this action.
+              const html = referencerFor(mainFrameId)(
+                neutralizeScripts(fallbackDom.html, afterName));
+              fallbackLines.push(JSON.stringify({
+                type: 'frame-snapshot',
+                snapshot: {
+                  callId: actionId,
+                  snapshotName: afterName,
+                  pageId,
+                  frameId: mainFrameId,
+                  frameUrl: recording.url || '',
+                  doctype: 'html',
+                  html,
+                  viewport,
+                  timestamp: snapTime,
+                  // No page-stamped capture instant exists for a synthetic
+                  // frame; the action's absolute end time is the closest
+                  // truthful wall clock, and keeps pairing working.
+                  wallTime: event.endTime || eventTime,
+                  collectionTime: 0,
+                  resourceOverrides,
+                  isMainFrame: true
+                }
+              }) + '\n');
+              afterEvent.afterSnapshot = afterName;
             }
           }
 
@@ -525,7 +657,11 @@ async function generatePlaywrightTraceInBrowser(recording) {
         }
 
         if (attachments.length > 0) afterEvent.attachments = attachments;
+
+        // Declaration first, then the snapshots it names.
         yield JSON.stringify(afterEvent) + '\n';
+        for (const line of afterLines) yield line;
+        for (const line of fallbackLines) yield line;
 
       } else if (event.type === 'screencast-frame') {
         // The continuous screencast: one line per frame, in arrival order. These
@@ -545,18 +681,45 @@ async function generatePlaywrightTraceInBrowser(recording) {
         }) + '\n';
 
       } else if (event.type === 'console') {
+        // The viewer renders console output only from a top-level
+        // `type: "console"` line, reading `messageType`, `args` and `location`.
+        // The older `type:"event", class:"Page", method:"console"` shape is not
+        // understood by the current viewer, so those messages were invisible.
+        const text = event.text || '';
+        yield JSON.stringify({
+          type: 'console',
+          messageType: event.messageType || 'log',
+          text,
+          // The args panel wants {preview, value} pairs. The recorder stores the
+          // joined text rather than per-argument handles, so the text is exposed
+          // as a single argument — enough for the viewer's rendering path.
+          args: event.args || [{ preview: text.slice(0, 200), value: text }],
+          location: event.location || { url: '', lineNumber: 0, columnNumber: 0 },
+          time: relTime(eventTime),
+          pageId
+        }) + '\n';
+
+      } else if (event.type === 'pageError') {
+        // Uncaught page exceptions surface in the viewer's Console panel and are
+        // counted as errors. The shape mirrors the official recorder's
+        // `_onPageError` event (serializeError nests the error one level deep).
+        const err = event.error || {};
         yield JSON.stringify({
           type: 'event',
           time: relTime(eventTime),
-          class: 'Page',
-          method: 'console',
+          class: 'BrowserContext',
+          method: 'pageError',
           params: {
-            type: event.messageType || 'log',
-            text: event.text || '',
-            location: event.location || { url: '', lineNumber: 0, columnNumber: 0 }
+            error: {
+              error: {
+                name: err.name || 'Error',
+                message: err.message || String(err.value || 'Uncaught error'),
+                stack: err.stack || ''
+              }
+            },
+            location: event.location || { url: '', line: 0, column: 0 }
           },
-          pageId,
-          internal: {}
+          pageId
         }) + '\n';
       } else if (event.type === 'navigation') {
         // Only the main frame's navigations enter the timeline: the line
@@ -590,42 +753,124 @@ async function generatePlaywrightTraceInBrowser(recording) {
   // ── trace.network ───────────────────────────────────────────────────────────
   async function* networkLines() {
     for await (const req of readRequests(session)) {
-      if (!req.url || !req.url.startsWith('http')) continue;
+      // Keep http(s) AND ws(s): a websocket handshake's URL is ws(s)://, and the
+      // viewer routes it to the Messages tab by `_resourceType === 'websocket'`.
+      if (!req.url || !/^https?:|^wss?:/.test(req.url)) continue;
+
+      const isWebSocket = req.resourceType === 'websocket';
 
       const postData = req.postDataSha1
         ? { _sha1: req.postDataSha1 }
         : (req.postDataText != null ? { text: req.postDataText } : undefined);
 
-      yield JSON.stringify({
-        type: 'resource-snapshot',
-        snapshot: {
-          pageref: pageId,
-          // Viewer matches same-frame responses first when resolving a URL.
-          _frameref: req.frameId || mainFrameId,
-          // Viewer picks the most recent response whose time is <= the snapshot
-          // timestamp; without this the last response wins for every snapshot.
-          _monotonicTime: relTime(req.timestamp || baseTime),
-          startedDateTime: new Date(req.timestamp || baseTime).toISOString(),
-          time: relTime(req.timestamp || baseTime),
-          request: {
-            url: req.url,
-            method: req.method || 'GET',
-            headers: req.requestHeaders || [],
-            postData
-          },
-          response: {
-            status: req.status || 0,
-            statusText: req.statusText || '',
-            headers: req.responseHeaders || [],
-            content: {
-              mimeType: req.mimeType || '',
-              size: req.bodySize || 0,
-              _sha1: req.bodyResource || undefined
-            }
+      // HAR scaffold the viewer dereferences WITHOUT a guard. `queryString` is
+      // read as `.length` by the Payload tab and `cookies` by "Copy as
+      // Fetch"/cURL; when either is absent the panel throws a TypeError and
+      // React unmounts the entire viewer (blank page). Official traces always
+      // carry them, so they are emitted even when empty.
+      let queryString = [];
+      try {
+        const parsed = new URL(req.url);
+        queryString = [...parsed.searchParams].map(([name, value]) => ({ name, value }));
+      } catch (_) { /* unparsable URL: an empty query string is correct */ }
+
+      // The viewer's network panel draws each request as
+      //   start    = _monotonicTime - (minimum across resources)
+      //   duration = time
+      // so `time` is a DURATION and `_monotonicTime` is the start offset.
+      // Writing the start offset into both makes every bar span from its own
+      // start to the same absolute point, pushing the waterfall past the end of
+      // the recording. A request that never finished (recording stopped mid
+      // flight) gets a zero duration rather than a bogus one.
+      const startedMs = req.timestamp || baseTime;
+      const durationMs = req.finishedAt && req.finishedAt > startedMs
+        ? req.finishedAt - startedMs
+        : 0;
+
+      // CDP reports the wire protocol ("h2", "http/1.1", "blob"); HAR wants the
+      // display spelling. This mirrors official's `internalHttpVersion()`
+      // one-for-one so a trace shows "HTTP/2.0" exactly where Playwright does.
+      const httpVersion = harHttpVersion(req.protocol);
+
+      // CDP's ResourceTiming expresses every phase in MILLISECONDS relative to
+      // `requestTime`, with -1 marking a phase that never happened. Taking a
+      // difference between two fields on that same clock therefore yields
+      // milliseconds directly (verified against playwright-core's own
+      // `millisToRoundishMillis` use). `harTimings` performs that arithmetic.
+      const timings = harTimings(req);
+
+      const snapshot = {
+        pageref: pageId,
+        // Viewer matches same-frame responses first when resolving a URL.
+        _frameref: req.frameId || mainFrameId,
+        // The request's start offset, used for both the "most recent response
+        // at this instant" lookup and the waterfall's left edge.
+        _monotonicTime: relTime(startedMs),
+        // CDP's resource classification; drives the panel's type filter and, for
+        // `websocket`, routes the row to the Messages tab.
+        _resourceType: isWebSocket ? 'websocket' : (req.resourceType || 'other'),
+        startedDateTime: new Date(startedMs).toISOString(),
+        time: durationMs,
+        request: {
+          url: req.url,
+          method: req.method || 'GET',
+          httpVersion,
+          cookies: [],
+          queryString,
+          headersSize: -1,
+          bodySize: postData && postData.text ? postData.text.length : -1,
+          headers: req.requestHeaders || [],
+          postData
+        },
+        response: {
+          status: req.status || 0,
+          statusText: req.statusText || '',
+          httpVersion,
+          cookies: [],
+          headers: req.responseHeaders || [],
+          headersSize: -1,
+          // A redirect hop names its successor here; the panel renders it as the
+          // redirect target row. Official writes '' for a non-redirect.
+          redirectURL: req.redirectURL || '',
+          // The viewer shows `_transferSize > 0 ? _transferSize : bodySize`,
+          // so both are written: the decoded size always, the wire size when
+          // CDP reported one.
+          bodySize: req.bodySize || 0,
+          _transferSize: req.encodedLength || 0,
+          content: {
+            mimeType: req.mimeType || '',
+            size: req.bodySize || 0,
+            _sha1: req.bodyResource || undefined
           }
         },
-        pageId
-      }) + '\n';
+        cache: {},
+        timings
+      };
+
+      // A failed request names its cause here; official's own HAR export writes
+      // exactly this field, and it is the only place the reason survives.
+      if (req.errorText) snapshot.response._failureText = req.errorText;
+
+      // Server address and TLS metadata. Official always emits `_serverPort`
+      // alongside `serverIPAddress`, so the two travel together rather than
+      // leaving a newer/older consumer to guess a port from a host. TLS details
+      // are narrowed to the five fields official publishes.
+      if (req.remoteIPAddress) {
+        snapshot.serverIPAddress = req.remoteIPAddress;
+        snapshot._serverPort = req.remotePort;
+      }
+      if (req.securityDetails) {
+        snapshot._securityDetails = harSecurityDetails(req.securityDetails);
+      }
+
+      // WebSocket frames ride the handshake's entry as `_webSocketMessages`; the
+      // Messages tab reads exactly this field (or a jsonl side-file). Frames are
+      // already normalized to {type, time, opcode, data} in the service worker.
+      if (isWebSocket && Array.isArray(req._webSocketMessages) && req._webSocketMessages.length) {
+        snapshot._webSocketMessages = req._webSocketMessages;
+      }
+
+      yield JSON.stringify({ type: 'resource-snapshot', snapshot, pageId }) + '\n';
     }
   }
 

@@ -9,7 +9,9 @@
     "test:trace": "playwright test --trace on-first-retry"
   },
   "devDependencies": {
-    "@playwright/test": "^1.45.0"
+    "@playwright/test": "^1.45.0",
+    "playwright-core-163": "npm:playwright-core@1.63.0",
+    "ws": "^8.21.3"
   },
   "keywords": [
     "playwright",

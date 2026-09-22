@@ -105,6 +105,7 @@ test('streams screencast frames continuously, not one per action', async ({ page
     // Frames must be spread across the recording rather than bunched at one end.
     expect(span).toBeGreaterThan(1_000);
   } finally {
+    server.closeAllConnections?.();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
