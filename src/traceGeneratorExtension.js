@@ -23,6 +23,13 @@ import {
 const RESOURCE_PREFIX = 'resources/';
 const LINE_CHUNK_BYTES = 64 * 1024;
 
+/** CDP Page.lifecycleEvent name -> Playwright load state. */
+const LIFECYCLE_STATE = {
+  DOMContentLoaded: 'domcontentloaded',
+  load: 'load',
+  networkIdle: 'networkidle'
+};
+
 /** Coalesce many small lines into larger chunks before they hit the compressor. */
 async function* chunkLines(lines) {
   let buffer = '';
@@ -738,6 +745,42 @@ async function generatePlaywrightTraceInBrowser(recording) {
           method: 'navigated',
           params: { url: event.url, name: event.name || '' },
           pageId,
+          internal: {}
+        }) + '\n';
+      } else if (event.type === 'lifecycle') {
+        // Surface the marker as a Frame.waitForLoadState({state}) action.
+        // It is a POINT event: zero duration with no snapshot attached —
+        // a lifecycle marker declares a moment in time, not a page state to
+        // render, so it must not dangle a snapshot name. The log line gives
+        // the action's Call panel something to show.
+        if (event.frameId !== mainFrameId) continue;
+        const state = LIFECYCLE_STATE[event.name];
+        if (!state) continue;
+        actionIndex++;
+        const actionId = `action-${actionIndex}`;
+        const markerTime = relTime(eventTime);
+        yield JSON.stringify({
+          type: 'before',
+          callId: actionId,
+          startTime: markerTime,
+          class: 'Frame',
+          method: 'waitForLoadState',
+          params: { state },
+          pageId,
+          wallTime: eventTime,
+          internal: {}
+        }) + '\n';
+        yield JSON.stringify({
+          type: 'log',
+          callId: actionId,
+          time: markerTime,
+          message: `  waiting for load state "${state}"`
+        }) + '\n';
+        yield JSON.stringify({
+          type: 'after',
+          callId: actionId,
+          endTime: markerTime,
+          wallTime: eventTime,
           internal: {}
         }) + '\n';
       }

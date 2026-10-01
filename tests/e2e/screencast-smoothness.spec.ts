@@ -61,7 +61,9 @@ test('streams screencast frames continuously, not one per action', async ({ page
     const lines = readEntry(zipPath, 'trace.trace').toString()
       .split('\n').filter(Boolean).map(l => JSON.parse(l));
     const frames = lines.filter(l => l.type === 'screencast-frame');
-    const actions = lines.filter(l => l.type === 'before');
+    // Lifecycle markers are point events, not user interactions: exclude them
+    // so "nothing was clicked" and the action-rate anchor stay correct.
+    const actions = lines.filter(l => l.type === 'before' && l.method !== 'waitForLoadState');
 
     console.log(`actions: ${actions.length}, screencast frames: ${frames.length}`);
 
@@ -165,7 +167,9 @@ test('captures an action at a higher frame rate than an idle page', async ({ pag
     const lines = readEntry(zipPath, 'trace.trace').toString()
       .split('\n').filter(Boolean).map(l => JSON.parse(l));
     const frames = lines.filter(l => l.type === 'screencast-frame');
-    const actions = lines.filter(l => l.type === 'before');
+    // Lifecycle markers are point events, not user interactions: exclude them
+    // so "nothing was clicked" and the action-rate anchor stay correct.
+    const actions = lines.filter(l => l.type === 'before' && l.method !== 'waitForLoadState');
     expect(actions.length).toBeGreaterThan(0);
 
     // Frames are stamped on the trace-relative clock; the action's own instant

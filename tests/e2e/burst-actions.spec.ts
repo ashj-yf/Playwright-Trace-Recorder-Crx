@@ -43,8 +43,13 @@ test('burst actions always carry after snapshots and never dangle input lines', 
 
     const lines = readEntry(zipPath, 'trace.trace').toString()
       .split('\n').filter(Boolean).map(l => JSON.parse(l));
-    const befores = lines.filter(l => l.type === 'before');
-    const afters = lines.filter(l => l.type === 'after');
+    // Lifecycle markers (Frame.waitForLoadState) are point events with no
+    // snapshots; exclude them from the interaction-action population.
+    const markerIds = new Set(
+      lines.filter(l => l.type === 'before' && l.method === 'waitForLoadState').map(l => l.callId)
+    );
+    const befores = lines.filter(l => l.type === 'before' && !markerIds.has(l.callId));
+    const afters = lines.filter(l => l.type === 'after' && !markerIds.has(l.callId));
     const frameSnapshotLines = lines.filter(l => l.type === 'frame-snapshot');
 
     const clicks = befores.filter(b => b.method === 'click');

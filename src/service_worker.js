@@ -570,6 +570,17 @@ async function startRecording(name, tabId) {
         }
       }
 
+      // Page.lifecycleEvent (DOMContentLoaded/load/networkIdle) is NOT emitted
+      // by default — Chromium gates it behind this command even though the
+      // public protocol marks it deprecated. Must precede the reload below or
+      // the first load's lifecycle markers are missed (this is exactly what
+      // playwright-core sends in its own session init).
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Page.setLifecycleEventsEnabled', { enabled: true });
+      } catch (e) {
+        console.warn('Could not enable lifecycle events:', e.message);
+      }
+
       // The frame tree (same-process iframes included) is synced from
       // Page.getFrameTree before every snapshot capture.
 
@@ -2326,6 +2337,17 @@ async function captureResponseBody(rec, sessionId, rid) {
   }
 }
 
+/** Smallest positive finish time for a request that started at `startedAt`.
+ *  Both ends are sampled from Date.now() at event arrival, so a localhost
+ *  small response can have requestWillBeSent and loadingFinished land in the
+ *  SAME millisecond — exporting a zero duration collapses the waterfall bar.
+ *  A completed request gets at least 1ms; 0 and 1 are indistinguishable at
+ *  this clock's resolution anyway. */
+function finishTimeAfter(startedAt, now) {
+  const t = now || Date.now();
+  return startedAt && t <= startedAt ? startedAt + 1 : t;
+}
+
 async function handleLoadingFinished(rec, sessionId, params, timestamp) {
   const rid = (sessionId || '') + '#' + params.requestId;
   const existing = await readRequest(rec.session, rid);
@@ -2335,7 +2357,7 @@ async function handleLoadingFinished(rec, sessionId, params, timestamp) {
     // When the response finished. The trace's `time` field is a request
     // DURATION (the viewer draws start from `_monotonicTime` and width from
     // `time`), so the duration can only be computed once both ends are known.
-    finishedAt: timestamp || Date.now()
+    finishedAt: finishTimeAfter(existing.timestamp, timestamp)
   });
   await captureResponseBody(rec, sessionId, rid);
 }
@@ -2363,7 +2385,7 @@ async function handleLoadingFailed(rec, sessionId, params) {
     ...(existing.status > 0 ? {} : { status: -1 }),
     // A failed request still consumed wall time; without this its duration
     // would be reported as zero and the bar would collapse.
-    finishedAt: Date.now()
+    finishedAt: finishTimeAfter(existing.timestamp)
   });
 }
 
@@ -2641,6 +2663,31 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       if (entry) entry.url = url;
       if (frameId === rec.mainFrameId && url !== rec.url) { rec.url = url; persistSession(rec); }
       await logEvent(rec, { type: 'navigation', frameId, url, name: name || '', timestamp: Date.now() });
+    });
+    return;
+  }
+
+  // Main-frame page lifecycle markers. "页面加载完成 / 所有请求完成" map to
+  // Playwright load states: DOMContentLoaded -> domcontentloaded, load -> load,
+  // networkIdle (zero connections for 500ms) -> networkidle. lifecycleEvent
+  // fires per frame on that frame's session, so child frames are mapped out
+  // here and never reach the timeline (the trace line the generator emits
+  // carries no frame identity, same as the navigation branch above).
+  if (method === 'Page.lifecycleEvent') {
+    const cdpFrameId = params.frameId;
+    const name = params.name;
+    if (name !== 'DOMContentLoaded' && name !== 'load' && name !== 'networkIdle') return;
+    enqueueRequestTask(rec, async () => {
+      if (cdpFrameId && !rec.frames.has(cdpFrameId)) await syncFrameTree(rec);
+      const frameId = frameIdForNetwork(rec, sessionId, { frameId: cdpFrameId });
+      if (frameId !== rec.mainFrameId) return;
+      await logEvent(rec, {
+        type: 'lifecycle',
+        frameId,
+        name,
+        loaderId: params.loaderId || '',
+        timestamp: Date.now()
+      });
     });
     return;
   }

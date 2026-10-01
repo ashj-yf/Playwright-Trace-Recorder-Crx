@@ -344,12 +344,31 @@ test('exported trace satisfies the viewer replay contract', async ({ page, conte
     }
 
     expect(report.totalActions).toBeGreaterThan(0);
+
+    // Lifecycle markers (Frame.waitForLoadState) are point events with no
+    // snapshot BY DESIGN; they split the old "every action renders"
+    // population in two. Every INTERACTION action must still resolve a DOM
+    // snapshot phase, and every marker must stay snapshot-less.
+    const markerCallIds = new Set(
+      lines
+        .filter(l => l.type === 'before' && l.method === 'waitForLoadState')
+        .map(l => l.callId)
+    );
+    const perAction = Object.entries(report.perAction);
+    const interactionPhases = perAction.filter(([callId]) => !markerCallIds.has(callId));
+    const markerPhases = perAction.filter(([callId]) => markerCallIds.has(callId));
+
+    expect(interactionPhases.length, 'recording has interaction actions apart from markers').toBeGreaterThan(0);
+    const unrendered = interactionPhases.filter(([, phases]) => !phases.length).map(([callId]) => callId);
     expect(
-      report.renderableActions,
-      `no action resolved a DOM snapshot phase through Playwright's TraceLoader ` +
-      `(${report.renderableActions}/${report.totalActions}); the viewer would render blank frames. ` +
-      `Phases found: ${report.phases.join(', ') || '(none)'}`
-    ).toBe(report.totalActions);
+      unrendered,
+      `an interaction action resolved no DOM snapshot phase through Playwright's TraceLoader; ` +
+      'the viewer would render it blank'
+    ).toEqual([]);
+    expect(
+      markerPhases.every(([, phases]) => phases.length === 0),
+      'lifecycle markers must stay snapshot-less by design'
+    ).toBe(true);
   } finally {
     server.closeAllConnections?.();
     server.close();
