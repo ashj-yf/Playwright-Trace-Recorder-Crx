@@ -34,3 +34,5 @@ tests/test-results/
 # Screenshots and assets (can be removed if not needed)
 screenshots/
 assets/*.gif
+
+docs
