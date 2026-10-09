@@ -1,0 +1,48 @@
+name: Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches manifest version
+        run: |
+          MANIFEST_VERSION=$(grep -o '"version": *"[^"]*"' manifest.json | cut -d'"' -f4)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$MANIFEST_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match manifest.json version ${MANIFEST_VERSION}. Bump manifest.json and src/panel.html before tagging."
+            exit 1
+          fi
+          echo "Releasing extension v${MANIFEST_VERSION}"
+
+      - name: Build extension package
+        run: bash build.sh
+
+      - name: Verify package
+        run: |
+          ZIP_FILE="build/PlaywrightTraceRecorder_${GITHUB_REF_NAME#v}.zip"
+          test -f "$ZIP_FILE"
+          unzip -l "$ZIP_FILE" | grep -q manifest.json
+          unzip -l "$ZIP_FILE" | grep -q src/service_worker.js
+          echo "Package OK: $ZIP_FILE"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "build/PlaywrightTraceRecorder_${GITHUB_REF_NAME#v}.zip" \
+            --title "Playwright Trace Recorder ${GITHUB_REF_NAME}" \
+            --generate-notes
