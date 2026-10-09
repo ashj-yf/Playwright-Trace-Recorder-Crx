@@ -22,7 +22,7 @@ test('should navigate GitHub (baseline with Playwright tracing)', async ({ page 
   await page.getByRole('link', { name: 'Issues' }).click();
   await expect(page).toHaveURL(/.*\/issues/);
 
-  await page.getByRole('link', { name: 'Pull requests' }).click();
+  await page.getByRole('link', { name: 'Pull requests', exact: true }).click();
   await expect(page).toHaveURL(/.*\/pulls/);
   await page.getByRole('link', { name: 'Code', exact: true }).click();
 

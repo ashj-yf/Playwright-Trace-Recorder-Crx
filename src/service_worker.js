@@ -425,6 +425,11 @@ function createRecording(name, tabId) {
     startTime: Date.now(),
     mainFrameId: 'frame@' + shortId(),
     mainCdpFrameId: null,
+    // Loader id of the main frame's current document. Lifecycle events carry a
+    // loaderId and Chromium replays them for EVERY loader (redirect chain,
+    // enable-time replay); this is what tells the current document's events
+    // from loader noise so the generator emits one marker per navigation.
+    mainLoaderId: '',
     debuggeeTabId: tabId || null,
     url: null,
     viewport: null,
@@ -2662,7 +2667,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       const entry = rec.frames.get(cdpFrameId);
       if (entry) entry.url = url;
       if (frameId === rec.mainFrameId && url !== rec.url) { rec.url = url; persistSession(rec); }
-      await logEvent(rec, { type: 'navigation', frameId, url, name: name || '', timestamp: Date.now() });
+      // frameNavigated brings a NEW document loader; SPA route changes keep
+      // the current one. The generator rounds lifecycle markers by this id.
+      let loaderId = '';
+      if (method === 'Page.frameNavigated') {
+        loaderId = (params.frame && params.frame.loaderId) || '';
+        if (frameId === rec.mainFrameId && loaderId) rec.mainLoaderId = loaderId;
+      } else if (frameId === rec.mainFrameId) {
+        loaderId = rec.mainLoaderId;
+      }
+      await logEvent(rec, {
+        type: 'navigation', frameId, url, name: name || '', loaderId, timestamp: Date.now()
+      });
     });
     return;
   }

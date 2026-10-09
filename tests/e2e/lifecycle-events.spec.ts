@@ -9,19 +9,20 @@ import {
 import { inspectPhases } from './support/viewerOracle';
 
 /**
- * Page lifecycle markers.
+ * Page lifecycle markers, folded to ONE point per navigation.
  *
- * "页面加载完成 / 所有请求完成"在 Playwright 语义里对应主 frame 的三个
- * lifecycle 状态：DOMContentLoaded、load、networkIdle（0 连接持续 500ms，
- * 与 waitUntil:'networkidle' 同口径）。CDP 的 Page.lifecycleEvent 一直
- * 到达 worker，但白名单里没有该分支，三个标记全部丢失。
+ * "页面加载完成 / 所有请求完成"在 Playwright 语义里对应 lifecycle 状态
+ * DOMContentLoaded、load、networkIdle（0 连接持续 500ms，与
+ * waitUntil:'networkidle' 同口径）。但 Chromium 会为每个 loader 重放
+ * lifecycle —— 开启时补发旧 loader、重定向链每个中间 loader 都发 ——
+ * 一次录制开头就能冒出十几个 waitForLoadState。
  *
- * 标记以 Frame.waitForLoadState({state}) action 进入时间线：点事件、
- * 零时长、不带快照引用（没有可渲染的页面状态），log 行说明等待的状态。
- * 每次主 frame 导航后三个标记各出现一次，顺序为
- * domcontentloaded -> load -> networkidle。
+ * 归并规则：以主 frame 每次导航（frameNavigated/SPA 路由）为一轮，只收
+ * loaderId 与该文档一致的 lifecycle，每轮输出一个 Frame.waitForLoadState
+ * 点事件（零时长、无快照），state 取该文档实际到达的最深状态，时间取
+ * 该状态最后一次达成时刻。本例中两次导航都到达 networkidle。
  */
-test('records DOMContentLoaded, load and networkIdle as waitForLoadState actions', async ({ page, context, extensionId }) => {
+test('folds lifecycle events into one waitForLoadState per navigation', async ({ page, context, extensionId }) => {
   test.setTimeout(180_000);
   const server = await startServer();
 
@@ -59,20 +60,23 @@ test('records DOMContentLoaded, load and networkIdle as waitForLoadState actions
       .filter(b => b.method === 'waitForLoadState')
       .sort((a, b) => a.startTime - b.startTime);
     const states = markerBefores.map(b => b.params.state);
+    const navs = lines.filter(l => l.type === 'event' && l.class === 'Frame' && l.method === 'navigated');
     console.log('load-state markers:', states.join(','));
 
-    // ── Two complete rounds, each in lifecycle order ─────────────────────
-    expect(markerBefores.length).toBeGreaterThanOrEqual(6);
-    const stateSeq = states.join(',');
+    // ── Exactly one marker per navigation ────────────────────────────────
+    // Two navigations (the start reload + frame.html); the enable-time
+    // replay and any other loader noise must not add markers.
     expect(
-      stateSeq,
-      'each navigation must emit domcontentloaded before load before networkidle'
-    ).toContain('domcontentloaded,load,networkidle');
-    // The frame.html navigation emits its own complete round right after.
-    expect(
-      states.slice(3, 6),
-      'the frame.html navigation emits its own three markers'
-    ).toEqual(['domcontentloaded', 'load', 'networkidle']);
+      markerBefores.length,
+      `expected 2 folded markers, got states: ${states.join(',')}`
+    ).toBe(2);
+    // Both documents drain to networkIdle within the waits above.
+    expect(states).toEqual(['networkidle', 'networkidle']);
+
+    // The second marker must not precede the navigation it completes.
+    const frameNav = navs.find(n => n.params.url.endsWith('/frame.html'));
+    expect(frameNav).toBeTruthy();
+    expect(markerBefores[1].startTime).toBeGreaterThanOrEqual(frameNav!.time);
 
     // ── Point events: zero duration, before/after paired ─────────────────
     for (const before of markerBefores) {
@@ -116,7 +120,6 @@ test('records DOMContentLoaded, load and networkIdle as waitForLoadState actions
     }
 
     // ── Navigations still recorded, metadata owns the final url ──────────
-    const navs = lines.filter(l => l.type === 'event' && l.class === 'Frame' && l.method === 'navigated');
     expect(navs.length).toBeGreaterThanOrEqual(2);
     expect(JSON.parse(readEntry(zipPath, 'metadata.json').toString()).pages[0].url)
       .toContain('/frame.html');

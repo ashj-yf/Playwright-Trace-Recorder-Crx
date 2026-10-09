@@ -498,6 +498,54 @@ async function generatePlaywrightTraceInBrowser(recording) {
     let actionIndex = 0;
     const pendingActions = new Map();
 
+    // Lifecycle markers are folded into ONE point per main-frame navigation.
+    // Chromium emits lifecycle events for every loader (redirect chain, the
+    // enable-time replay, OOP iframes) — far more than actual navigations —
+    // so events are collected into the round keyed by the navigation event's
+    // loaderId and emitted only when the next navigation closes the round.
+    let lifecycleRound = null;
+    async function* flushLifecycleRound() {
+      const round = lifecycleRound;
+      if (!round || round.states.size === 0) return;
+      // Deepest state the document actually reached; same state arriving
+      // multiple times keeps the LAST instant (a broken-then-restored idle).
+      let state = 'domcontentloaded';
+      for (const candidate of ['networkidle', 'load', 'domcontentloaded']) {
+        if (round.states.has(candidate)) { state = candidate; break; }
+      }
+      const eventTime = round.states.get(state);
+      const markerTime = relTime(eventTime);
+      actionIndex++;
+      const actionId = `action-${actionIndex}`;
+      // Point event: zero duration, no snapshot — a load-state marker
+      // declares a moment, not a page state to render, so it must not dangle
+      // a snapshot name. The log line feeds the Call panel.
+      yield JSON.stringify({
+        type: 'before',
+        callId: actionId,
+        startTime: markerTime,
+        class: 'Frame',
+        method: 'waitForLoadState',
+        params: { state },
+        pageId,
+        wallTime: eventTime,
+        internal: {}
+      }) + '\n';
+      yield JSON.stringify({
+        type: 'log',
+        callId: actionId,
+        time: markerTime,
+        message: `  waiting for load state "${state}"`
+      }) + '\n';
+      yield JSON.stringify({
+        type: 'after',
+        callId: actionId,
+        endTime: markerTime,
+        wallTime: eventTime,
+        internal: {}
+      }) + '\n';
+    }
+
     // Continue from the primed iterator.
     const events = (async function* () {
       if (!firstEventResult.done) yield firstEventResult.value;
@@ -736,6 +784,11 @@ async function generatePlaywrightTraceInBrowser(recording) {
         // event store. `name` is the CDP frame name (iframe name attribute),
         // not the document title — official frameDispatcher semantics.
         if (event.frameId !== mainFrameId) continue;
+        // Close the previous round (emits its single folded marker) and open
+        // this one BEFORE the url-dedup continue below: a reload repeats the
+        // url but brings a new loader that still deserves its own marker.
+        yield* flushLifecycleRound();
+        lifecycleRound = { loaderId: event.loaderId || '', states: new Map() };
         if (lastNavigatedUrl.get(event.frameId) === event.url) continue;
         lastNavigatedUrl.set(event.frameId, event.url);
         yield JSON.stringify({
@@ -748,43 +801,22 @@ async function generatePlaywrightTraceInBrowser(recording) {
           internal: {}
         }) + '\n';
       } else if (event.type === 'lifecycle') {
-        // Surface the marker as a Frame.waitForLoadState({state}) action.
-        // It is a POINT event: zero duration with no snapshot attached —
-        // a lifecycle marker declares a moment in time, not a page state to
-        // render, so it must not dangle a snapshot name. The log line gives
-        // the action's Call panel something to show.
         if (event.frameId !== mainFrameId) continue;
+        // Fold into the round only when the event belongs to THIS document's
+        // loader. Events before any navigation (enable-time replay of the old
+        // loader) or from a redirect/intermediate loader are ignored — they
+        // are what produced dozens of markers on redirect-heavy pages. An
+        // unknown round loader widens the filter instead of dropping events.
+        const round = lifecycleRound;
+        if (!round) continue;
+        if (round.loaderId && event.loaderId !== round.loaderId) continue;
         const state = LIFECYCLE_STATE[event.name];
         if (!state) continue;
-        actionIndex++;
-        const actionId = `action-${actionIndex}`;
-        const markerTime = relTime(eventTime);
-        yield JSON.stringify({
-          type: 'before',
-          callId: actionId,
-          startTime: markerTime,
-          class: 'Frame',
-          method: 'waitForLoadState',
-          params: { state },
-          pageId,
-          wallTime: eventTime,
-          internal: {}
-        }) + '\n';
-        yield JSON.stringify({
-          type: 'log',
-          callId: actionId,
-          time: markerTime,
-          message: `  waiting for load state "${state}"`
-        }) + '\n';
-        yield JSON.stringify({
-          type: 'after',
-          callId: actionId,
-          endTime: markerTime,
-          wallTime: eventTime,
-          internal: {}
-        }) + '\n';
+        round.states.set(state, eventTime);
       }
     }
+    // The last navigation's round has no following navigation to flush it.
+    yield* flushLifecycleRound();
   }
 
   try {
